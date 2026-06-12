@@ -339,19 +339,27 @@ namespace QexowCamGui
             {
                 try
                 {
+                    string correlationId = Guid.NewGuid().ToString("N");
                     Dictionary<string, object> payload = new Dictionary<string, object>();
                     payload["targetAgent"] = agentName;
                     payload["sourceAgent"] = "windows-gui";
                     payload["sourceNode"] = Environment.MachineName;
-                    payload["message"] = "CAM GUI test: reply with your agent name, node name, and current status.";
+                    payload["message"] = "CAM GUI test " + correlationId + ": reply with your agent name, node name, current status, and this test id.";
 
                     Dictionary<string, object> sendResult = ApiPost("/send", payload);
-                    string pretty = json.Serialize(sendResult);
+                    string turnId = NestedValue(sendResult, "message", "turnId");
                     InvokeUi(delegate
                     {
                         outputBox.Text = AppendLine(outputBox.Text, "Message sent. Awaiting/recording response path...");
-                        outputBox.Text = AppendLine(outputBox.Text, pretty);
-                        MessageBox.Show(this, pretty, "Qexow CAM test result", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        outputBox.Text = AppendLine(outputBox.Text, "Delivery accepted. turnId=" + turnId + " testId=" + correlationId);
+                    });
+
+                    string response = WaitForAgentResponse(agentName, correlationId, turnId, 90000);
+                    InvokeUi(delegate
+                    {
+                        outputBox.Text = AppendLine(outputBox.Text, "Agent response from " + agentName + ":");
+                        outputBox.Text = AppendLine(outputBox.Text, response);
+                        MessageBox.Show(this, response, "Qexow CAM agent response", MessageBoxButtons.OK, MessageBoxIcon.Information);
                         testButton.Enabled = true;
                     });
                     log("test-ok agent=" + agentName);
@@ -367,6 +375,147 @@ namespace QexowCamGui
                     log("test-error agent=" + agentName + " error=" + ex.Message);
                 }
             });
+        }
+
+        private string WaitForAgentResponse(string agentName, string correlationId, string turnId, int timeoutMs)
+        {
+            Stopwatch stopwatch = Stopwatch.StartNew();
+            string lastSummary = "";
+            int nextStatusAt = 10000;
+            while (stopwatch.ElapsedMilliseconds < timeoutMs)
+            {
+                try
+                {
+                    Dictionary<string, object> readResult = ApiGet("/agents/read?name=" + Uri.EscapeDataString(agentName) + "&includeTurns=true&turns=8");
+                    string response = FindAgentResponse(readResult, correlationId, turnId);
+                    if (!String.IsNullOrWhiteSpace(response)) return response;
+                    lastSummary = SummarizeLatestAgentMessage(readResult);
+                }
+                catch (Exception ex)
+                {
+                    lastSummary = "read error: " + ex.Message;
+                }
+
+                if (stopwatch.ElapsedMilliseconds >= nextStatusAt)
+                {
+                    int elapsedSeconds = (int)(stopwatch.ElapsedMilliseconds / 1000);
+                    InvokeUi(delegate
+                    {
+                        outputBox.Text = AppendLine(outputBox.Text, "Still waiting for " + agentName + " response... " + elapsedSeconds + "s");
+                    });
+                    nextStatusAt += 10000;
+                }
+                Thread.Sleep(2000);
+            }
+
+            throw new Exception("Timed out waiting for " + agentName + " to answer testId=" + correlationId + ". Last observed agent message: " + lastSummary);
+        }
+
+        private string FindAgentResponse(Dictionary<string, object> readResult, string correlationId, string turnId)
+        {
+            Dictionary<string, object> thread = ExtractThread(readResult);
+            ArrayList turns = thread != null && thread.ContainsKey("turns") ? thread["turns"] as ArrayList : null;
+            if (turns == null) return "";
+
+            for (int i = turns.Count - 1; i >= 0; i--)
+            {
+                Dictionary<string, object> turn = turns[i] as Dictionary<string, object>;
+                if (turn == null) continue;
+                bool isSendTurn = !String.IsNullOrWhiteSpace(turnId) && String.Equals(Value(turn, "id"), turnId, StringComparison.OrdinalIgnoreCase);
+                ArrayList items = turn.ContainsKey("items") ? turn["items"] as ArrayList : null;
+                if (items == null) continue;
+                for (int j = items.Count - 1; j >= 0; j--)
+                {
+                    Dictionary<string, object> item = items[j] as Dictionary<string, object>;
+                    if (item == null || Value(item, "type") != "agentMessage") continue;
+                    string text = ExtractText(item).Trim();
+                    if (String.IsNullOrWhiteSpace(text)) continue;
+                    if (text.IndexOf(correlationId, StringComparison.OrdinalIgnoreCase) >= 0) return text;
+                    if (isSendTurn) return text;
+                }
+            }
+
+            return "";
+        }
+
+        private string SummarizeLatestAgentMessage(Dictionary<string, object> readResult)
+        {
+            Dictionary<string, object> thread = ExtractThread(readResult);
+            ArrayList turns = thread != null && thread.ContainsKey("turns") ? thread["turns"] as ArrayList : null;
+            if (turns == null) return "";
+            for (int i = turns.Count - 1; i >= 0; i--)
+            {
+                Dictionary<string, object> turn = turns[i] as Dictionary<string, object>;
+                if (turn == null) continue;
+                ArrayList items = turn.ContainsKey("items") ? turn["items"] as ArrayList : null;
+                if (items == null) continue;
+                for (int j = items.Count - 1; j >= 0; j--)
+                {
+                    Dictionary<string, object> item = items[j] as Dictionary<string, object>;
+                    if (item == null || Value(item, "type") != "agentMessage") continue;
+                    string text = ExtractText(item).Trim();
+                    if (text.Length > 200) return text.Substring(0, 200);
+                    return text;
+                }
+            }
+            return "";
+        }
+
+        private Dictionary<string, object> ExtractThread(Dictionary<string, object> readResult)
+        {
+            if (readResult == null || !readResult.ContainsKey("thread")) return null;
+            Dictionary<string, object> thread = readResult["thread"] as Dictionary<string, object>;
+            if (thread != null && thread.ContainsKey("thread") && thread["thread"] is Dictionary<string, object>)
+            {
+                return (Dictionary<string, object>)thread["thread"];
+            }
+            return thread;
+        }
+
+        private string ExtractText(Dictionary<string, object> item)
+        {
+            string text = Value(item, "text");
+            if (!String.IsNullOrWhiteSpace(text)) return text;
+            if (!item.ContainsKey("content") || item["content"] == null) return "";
+            string contentString = item["content"] as string;
+            if (contentString != null) return contentString;
+            ArrayList contentList = item["content"] as ArrayList;
+            if (contentList == null) return "";
+            StringBuilder builder = new StringBuilder();
+            foreach (object part in contentList)
+            {
+                string partString = part as string;
+                if (partString != null)
+                {
+                    if (builder.Length > 0) builder.AppendLine();
+                    builder.Append(partString);
+                    continue;
+                }
+                Dictionary<string, object> partMap = part as Dictionary<string, object>;
+                if (partMap != null)
+                {
+                    string partText = Value(partMap, "text");
+                    if (String.IsNullOrWhiteSpace(partText)) partText = Value(partMap, "content");
+                    if (!String.IsNullOrWhiteSpace(partText))
+                    {
+                        if (builder.Length > 0) builder.AppendLine();
+                        builder.Append(partText);
+                    }
+                }
+            }
+            return builder.ToString();
+        }
+
+        private static string NestedValue(Dictionary<string, object> map, params string[] keys)
+        {
+            object current = map;
+            foreach (string key in keys)
+            {
+                Dictionary<string, object> currentMap = current as Dictionary<string, object>;
+                if (currentMap == null || !currentMap.ContainsKey(key) || currentMap[key] == null) return "";
+                current = currentMap[key];
+            }
+            return Convert.ToString(current);
         }
 
         private List<Dictionary<string, object>> LoadAgents()
