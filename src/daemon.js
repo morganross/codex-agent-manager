@@ -467,10 +467,61 @@ export class AgentManagerDaemon {
           if (!targetAgentUuid) {
             throw new Error(`Target Antigravity agent ${name} is missing a conversation UUID.`);
           }
+          let extractedTurns = [];
+          if (includeTurns) {
+            const turnsParam = url.searchParams.get("turns");
+            const requestedTurns = turnsParam ? parseInt(turnsParam, 10) : 0;
+            if (requestedTurns > 0) {
+              const brainDir = path.join(os.homedir(), ".gemini", "antigravity", "brain");
+              const transcriptPath = path.join(brainDir, targetAgentUuid, ".system_generated", "logs", "transcript_full.jsonl");
+              if (fs.existsSync(transcriptPath)) {
+                try {
+                  const content = fs.readFileSync(transcriptPath, "utf8");
+                  const lines = content.split(/\r?\n/).filter(Boolean);
+                  
+                  let allTurns = [];
+                  let currentTurn = { input: "", thought: "", tool_calls: "", output: "" };
+                  
+                  const truncate = (str, limit = 5000) => str.length > limit ? str.substring(0, limit) + "... (truncated)" : str;
+
+                  for (const line of lines) {
+                    try {
+                      const step = JSON.parse(line);
+                      if (step.type === "USER_INPUT") {
+                        if (currentTurn.input || currentTurn.thought) allTurns.push(currentTurn);
+                        currentTurn = { input: truncate(step.content || ""), thought: "", tool_calls: "", output: "" };
+                      } else if (step.type === "PLANNER_RESPONSE") {
+                        if (step.thinking) currentTurn.thought += step.thinking + "\n";
+                        if (step.tool_calls && step.tool_calls.length > 0) {
+                          currentTurn.tool_calls += JSON.stringify(step.tool_calls, null, 2) + "\n";
+                        }
+                      } else if (step.status === "DONE" && step.content) {
+                        currentTurn.output += `[${step.type}] ${truncate(step.content)}\n`;
+                      }
+                    } catch (e) {}
+                  }
+                  if (currentTurn.input || currentTurn.thought) allTurns.push(currentTurn);
+                  
+                  const selectedTurns = allTurns.slice(-requestedTurns);
+                  extractedTurns = selectedTurns.map(t => {
+                    let formatted = "";
+                    if (t.input) formatted += `--- TRIGGER ---\n${t.input.trim()}\n\n`;
+                    if (t.thought) formatted += `--- THOUGHT ---\n${t.thought.trim()}\n\n`;
+                    if (t.tool_calls) formatted += `--- COMMANDS ---\n${t.tool_calls.trim()}\n\n`;
+                    if (t.output) formatted += `--- OUTPUT ---\n${t.output.trim()}`;
+                    return { content: formatted.trim() };
+                  });
+                } catch (e) {
+                  this.log("agent.read.transcript_error", { error: e.message });
+                }
+              }
+            }
+          }
+
           return json(res, 200, {
             ok: true,
             agent: targetAgentObj,
-            thread: { id: targetAgentUuid, status: { type: targetAgentObj.status || "idle" }, turns: [] }
+            thread: { id: targetAgentUuid, status: { type: targetAgentObj.status || "idle" }, turns: extractedTurns }
           });
         }
         const agent = getAgent(this.config, name);

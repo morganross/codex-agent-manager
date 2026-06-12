@@ -172,6 +172,66 @@ $response | ConvertTo-Json -Depth 5
 
   fs.writeFileSync(path.join(inboxSkillDir, "skill.json"), JSON.stringify(inboxSkillDef, null, 2), "utf8");
   logFunc("bootstrap.antigravity.skill", { message: `Skill 'cam_check_inbox' successfully installed at ${inboxSkillDir}` });
+
+  // Install Eavesdrop Skill
+  const eavesdropSkillDir = path.join(skillsDir, "qexow-cam-eavesdrop");
+  if (!fs.existsSync(eavesdropSkillDir)) {
+    fs.mkdirSync(eavesdropSkillDir, { recursive: true });
+  }
+
+  const eavesdropPs1 = `
+param (
+    [string]$TargetAgent,
+    [int]$Turns = 5
+)
+
+$tokenFile = "$env:USERPROFILE\\.qexow-cam\\secrets\\local-api-token"
+$configFile = "$env:USERPROFILE\\.qexow-cam\\config.json"
+
+if (-not (Test-Path $tokenFile)) {
+    Throw "CAM token file not found at $tokenFile. Fallbacks are disabled."
+}
+if (-not (Test-Path $configFile)) {
+    Throw "CAM config file not found at $configFile. Fallbacks are disabled."
+}
+
+$token = (Get-Content $tokenFile -Raw).Trim()
+$config = Get-Content $configFile -Raw | ConvertFrom-Json
+$port = $config.port
+
+$encodedName = [System.Uri]::EscapeDataString($TargetAgent)
+$uri = "http://127.0.0.1:$port/agents/read?name=$encodedName&includeTurns=true&turns=$Turns"
+
+$response = Invoke-RestMethod -Uri $uri -Method Get -Headers @{ Authorization = "Bearer $token" }
+
+if ($response.thread.turns) {
+    foreach ($turn in $response.thread.turns) {
+        Write-Host $turn.content
+        Write-Host "========================================"
+    }
+} else {
+    Write-Host "No history found for agent $TargetAgent."
+}
+`;
+  
+  fs.writeFileSync(path.join(eavesdropSkillDir, "Eavesdrop-Agent.ps1"), eavesdropPs1.trim(), "utf8");
+
+  const eavesdropSkillDef = {
+    name: "cam_eavesdrop",
+    description: "Look back over the shoulder of another agent and retrieve their most recent execution history. This will show you exactly what they thought, the tools they executed, and the tool outputs. Use this to review their progress.",
+    entrypoint: "pwsh.exe -File .\\Eavesdrop-Agent.ps1 -TargetAgent \"{{TargetAgent}}\" -Turns {{Turns}}",
+    parameters: {
+      type: "object",
+      properties: {
+        TargetAgent: { type: "string", description: "The name of the agent to eavesdrop on." },
+        Turns: { type: "integer", description: "The number of recent turns to retrieve. Defaults to 5." }
+      },
+      required: ["TargetAgent"]
+    }
+  };
+
+  fs.writeFileSync(path.join(eavesdropSkillDir, "skill.json"), JSON.stringify(eavesdropSkillDef, null, 2), "utf8");
+  logFunc("bootstrap.antigravity.skill", { message: `Skill 'cam_eavesdrop' successfully installed at ${eavesdropSkillDir}` });
 }
 
 function installCodexSkills(logFunc) {

@@ -423,7 +423,9 @@ async function commandAgent(args) {
     const opts = parseOptions(args.slice(1));
     const name = opts._[0];
     if (!name) throw new Error("agent name is required");
-    const result = await apiRequest("GET", `/agents/read?name=${encodeURIComponent(name)}&includeTurns=true`);
+    let url = `/agents/read?name=${encodeURIComponent(name)}&includeTurns=true`;
+    if (opts.turns) url += `&turns=${opts.turns}`;
+    const result = await apiRequest("GET", url);
     const thread = result.thread?.thread || result.thread;
     if (opts.latest) {
       console.log(JSON.stringify(summarizeThread(thread), null, 2));
