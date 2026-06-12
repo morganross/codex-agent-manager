@@ -1,16 +1,16 @@
 [Setup]
 AppName=Qexow CAM
-AppVersion=2.1.5
+AppVersion=2.1.6
 DefaultDirName={autopf}\Qexow CAM
 DefaultGroupName=Qexow CAM
 OutputDir=dist
 OutputBaseFilename=QexowCamSetup
 Compression=lzma
 SolidCompression=yes
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesInstallIn64BitMode=x64compatible
 ChangesEnvironment=yes
 SetupIconFile=compiler:SetupClassicIcon.ico
-CloseApplications=no
+CloseApplications=force
 RestartApplications=no
 PrivilegesRequired=none
 PrivilegesRequiredOverridesAllowed=dialog commandline
@@ -38,9 +38,42 @@ Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environmen
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Check: NeedsAddPath(ExpandConstant('{app}')) and not IsAdminInstallMode
 ; Launch tray on Windows startup (user-level)
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Qexow CAM"; ValueData: """{app}\cam.exe"" tray"; Components: tray
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Codex Agent Manager"; Flags: deletevalue
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Codex Agent Manager Tray"; Flags: deletevalue
+
+[InstallDelete]
+Type: files; Name: "{app}\cam-tray.exe"
+Type: files; Name: "{app}\tray_windows_release.exe"
+Type: files; Name: "{app}\cam-core.exe"
+Type: files; Name: "{app}\cam-bundle.cjs"
+Type: files; Name: "{app}\daemon-entry.js"
+Type: files; Name: "{userstartup}\CodexAgentManager.cmd"
+Type: files; Name: "{userstartup}\QexowCam.cmd"
+Type: files; Name: "{userstartup}\Codex Agent Manager.cmd"
+Type: files; Name: "{localappdata}\Qexow CAM\cam.exe"
+Type: files; Name: "{localappdata}\Qexow CAM\cam-bundle.cjs"
+Type: files; Name: "{localappdata}\Qexow CAM\daemon-entry.js"
+Type: files; Name: "{localappdata}\Qexow CAM\cam-tray.exe"
+Type: files; Name: "{localappdata}\Qexow CAM\tray_windows_release.exe"
+Type: dirifempty; Name: "{localappdata}\Qexow CAM"
+Type: files; Name: "{localappdata}\Programs\Codex Agent Manager\cam.exe"
+Type: files; Name: "{localappdata}\Programs\Codex Agent Manager\cam-bundle.cjs"
+Type: files; Name: "{localappdata}\Programs\Codex Agent Manager\daemon-entry.js"
+Type: files; Name: "{localappdata}\Programs\Codex Agent Manager\cam-tray.exe"
+Type: files; Name: "{localappdata}\Programs\Codex Agent Manager\tray_windows_release.exe"
+Type: dirifempty; Name: "{localappdata}\Programs\Codex Agent Manager"
 
 [UninstallRun]
+Filename: "taskkill"; Parameters: "/F /T /IM cam-tray.exe"; Flags: runhidden; RunOnceId: "KillOldTray"
+Filename: "taskkill"; Parameters: "/F /T /IM tray_windows_release.exe"; Flags: runhidden; RunOnceId: "KillOldTrayRelease"
+Filename: "taskkill"; Parameters: "/F /T /IM cam-core.exe"; Flags: runhidden; RunOnceId: "KillOldCore"
+Filename: "taskkill"; Parameters: "/F /T /IM cam.exe"; Flags: runhidden; RunOnceId: "KillCam"
 Filename: "{app}\cam.exe"; Parameters: "uninstall-service"; Flags: runhidden; RunOnceId: "UninstallService"
+
+[UninstallDelete]
+Type: files; Name: "{userstartup}\CodexAgentManager.cmd"
+Type: files; Name: "{userstartup}\QexowCam.cmd"
+Type: files; Name: "{userstartup}\Codex Agent Manager.cmd"
 
 [Run]
 ; Record local startup metadata. This does not create scheduled tasks or shell scripts.
@@ -49,6 +82,27 @@ Filename: "{app}\cam.exe"; Parameters: "install-service"; StatusMsg: "Configurin
 Filename: "{app}\cam.exe"; Parameters: "tray"; Description: "Launch Qexow CAM System Tray"; Flags: postinstall nowait; Components: tray; Check: not IsHeadlessInstall
 
 [Code]
+procedure KillProcess(ImageName: string);
+var
+  ResultCode: Integer;
+begin
+  Exec('taskkill.exe', '/F /T /IM ' + ImageName, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure DeleteScheduledTask(TaskName: string);
+var
+  ResultCode: Integer;
+begin
+  Exec('schtasks.exe', '/Delete /TN "' + TaskName + '" /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure DeleteIfExists(PathName: string);
+begin
+  if FileExists(PathName) then begin
+    DeleteFile(PathName);
+  end;
+end;
+
 function IsHeadlessInstall(): Boolean;
 var
   i: Integer;
@@ -60,6 +114,25 @@ begin
       exit;
     end;
   end;
+end;
+
+function InitializeSetup(): Boolean;
+begin
+  // Stop every known CAM executable name before files are replaced.
+  KillProcess('cam.exe');
+  KillProcess('cam-core.exe');
+  KillProcess('cam-tray.exe');
+  KillProcess('tray_windows_release.exe');
+
+  // Remove old task/startup launch points so only the current tray command starts.
+  DeleteScheduledTask('CodexAgentManager');
+  DeleteScheduledTask('Codex Agent Manager');
+  DeleteScheduledTask('QexowCam');
+  DeleteIfExists(ExpandConstant('{userstartup}\CodexAgentManager.cmd'));
+  DeleteIfExists(ExpandConstant('{userstartup}\QexowCam.cmd'));
+  DeleteIfExists(ExpandConstant('{userstartup}\Codex Agent Manager.cmd'));
+
+  Result := True;
 end;
 
 function NeedsAddPath(Param: string): boolean;
