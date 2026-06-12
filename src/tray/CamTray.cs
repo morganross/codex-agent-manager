@@ -193,7 +193,12 @@ namespace CamTray
 
         public TrayApplicationContext()
         {
-            // Create Context Menu
+            InitializeContext();
+            EnsureDaemonRunning();
+        }
+
+        private void InitializeContext()
+        {
             ContextMenuStrip contextMenu = new ContextMenuStrip();
             contextMenu.Items.Add("Status", null, Status_Click);
             contextMenu.Items.Add("Start Daemon", null, Start_Click);
@@ -211,6 +216,28 @@ namespace CamTray
             };
 
             trayIcon.DoubleClick += Status_Click;
+        }
+
+        private void EnsureDaemonRunning()
+        {
+            try
+            {
+                using (var client = new System.Net.Sockets.TcpClient())
+                {
+                    var result = client.BeginConnect("127.0.0.1", 37631, null, null);
+                    bool success = result.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(1));
+                    if (success)
+                    {
+                        client.EndConnect(result);
+                        return; // Daemon is already running
+                    }
+                }
+            }
+            catch {}
+
+            // If we reach here, daemon is not running on port 37631, so start it
+            string output = RunCamCommand("daemon start");
+            Console.WriteLine("Auto-started daemon: " + output);
         }
 
         private void Status_Click(object sender, EventArgs e)

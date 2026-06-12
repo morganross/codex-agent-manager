@@ -278,7 +278,7 @@ async function commandDaemon(args) {
       stdio: ["ignore", out, out],
       windowsHide: true,
       env: process.env,
-      shell: true,
+      shell: false,
     });
     child.unref();
     console.log(`started daemon pid=${child.pid}`);
@@ -803,7 +803,10 @@ function daemonNodePath() {
 }
 
 function installWindowsTask(name) {
-  const taskCommand = `"${daemonNodePath()}" "${daemonScriptPath()}"`;
+  const node = daemonNodePath();
+  const isSea = !node.endsWith("node") && !node.endsWith("node.exe");
+  const args = isSea ? `"daemon-run"` : `"${daemonScriptPath()}"`;
+  const taskCommand = `"${node}" ${args}`;
   const create = spawnSync("schtasks.exe", [
     "/Create",
     "/F",
@@ -836,11 +839,14 @@ function installWindowsStartupFallback(name) {
   const startupDir = path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "Microsoft", "Windows", "Start Menu", "Programs", "Startup");
   fs.mkdirSync(startupDir, { recursive: true });
   const file = path.join(startupDir, `${name}.cmd`);
+  const node = daemonNodePath();
+  const isSea = !node.endsWith("node") && !node.endsWith("node.exe");
+  const args = isSea ? `"daemon-run"` : `"${daemonScriptPath()}"`;
   const lines = [
     "@echo off",
     `set CAM_HOME=${paths().root}`,
     `set CODEX_HOME=${loadConfig().codexHome}`,
-    `start "" /min "${daemonNodePath()}" "${daemonScriptPath()}"`,
+    `start "" /min "${node}" ${args}`,
     "",
   ];
   fs.writeFileSync(file, lines.join("\r\n"), "utf8");
@@ -861,15 +867,19 @@ function installSystemdUserService(name) {
     `CAM_HOME=${paths().root}`,
     `CODEX_HOME=${loadConfig().codexHome}`,
   ];
+  const node = daemonNodePath();
+  const isSea = !node.endsWith("node") && !node.endsWith("node.exe");
+  const args = isSea ? `daemon-run` : systemdEscape(daemonScriptPath());
   const unit = [
     "[Unit]",
-    "Description=Qexow CAM",
+    "Description=Qexow CAM Daemon",
+    "After=network.target",
     "",
     "[Service]",
     "Type=simple",
     `WorkingDirectory=${projectRoot()}`,
     ...env.map((item) => `Environment=${systemdEscape(item)}`),
-    `ExecStart=${systemdEscape(daemonNodePath())} ${systemdEscape(daemonScriptPath())}`,
+    `ExecStart=${systemdEscape(node)} ${args}`,
     "Restart=always",
     "RestartSec=5",
     "",
