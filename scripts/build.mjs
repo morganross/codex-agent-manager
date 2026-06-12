@@ -51,15 +51,15 @@ function setWindowsGuiSubsystem(exePath) {
   console.log(`[BUILD] Windows subsystem for ${path.basename(exePath)}: ${current} -> ${windowsGui}`);
 }
 
-function compileTrayProofHost() {
+function compileWindowsGui() {
   const cscPath = "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe";
   if (!fs.existsSync(cscPath)) {
-    console.warn(`[BUILD] csc.exe not found at ${cscPath}; skipping qexow-tray-proof.exe`);
+    console.warn(`[BUILD] csc.exe not found at ${cscPath}; skipping qexow-cam-gui.exe`);
     return false;
   }
-  console.log("\n[BUILD] Compiling qexow-tray-proof.exe...");
-  spawnSync("taskkill.exe", ["/F", "/T", "/IM", "qexow-tray-proof.exe"], { stdio: "ignore" });
-  run(`"${cscPath}" /nologo /target:winexe /out:dist\\qexow-tray-proof.exe src\\windows\\TrayProofHost.cs`);
+  console.log("\n[BUILD] Compiling qexow-cam-gui.exe...");
+  spawnSync("taskkill.exe", ["/F", "/T", "/IM", "qexow-cam-gui.exe"], { stdio: "ignore" });
+  run(`"${cscPath}" /nologo /target:winexe /reference:System.Web.Extensions.dll /out:dist\\qexow-cam-gui.exe src\\windows\\QexowCamGui.cs`);
   return true;
 }
 
@@ -105,8 +105,8 @@ if (fs.existsSync(arm64Base)) {
 }
 
 console.log("\n[BUILD] Step 6: Cleaning up intermediate dist files...");
-const hasTrayProof = compileTrayProofHost();
-const keep = new Set(["cam.exe", "cam-bundle.cjs", "cam-linux-x64", "cam-linux-arm64", "qexow-tray-proof.exe"]);
+const hasWindowsGui = compileWindowsGui();
+const keep = new Set(["cam.exe", "cam-bundle.cjs", "cam-linux-x64", "cam-linux-arm64", "qexow-cam-gui.exe"]);
 for (const file of fs.readdirSync(DIST)) {
   if (!keep.has(file)) {
     try {
@@ -119,6 +119,7 @@ for (const file of fs.readdirSync(DIST)) {
 
 console.log("\n[BUILD] ✅ Build complete! Outputs:");
 console.log(`  dist/cam.exe         — Windows x64 binary`);
+if (hasWindowsGui) console.log("  dist/qexow-cam-gui.exe - Windows GUI shell and tray app");
 if (hasX64) console.log(`  dist/cam-linux-x64   — Linux x64 binary`);
 if (hasArm64) console.log(`  dist/cam-linux-arm64 — Linux arm64 binary`);
 console.log(`  dist/cam-bundle.cjs  — Raw Javascript bundle`);
