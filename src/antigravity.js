@@ -103,7 +103,7 @@ $response | ConvertTo-Json -Depth 5
 
   const skillDef = {
     name: "cam_send_message",
-    description: "Send a message to another agent via the Qexow CAM (CAM) protocol. Use this to respond to incoming requests from other agents.",
+    description: `Send a message to another agent via the Qexow CAM (CAM) protocol. Use this to respond to incoming requests from other agents. Boss Agents: If you are a Boss agent, please read the rules of engagement at: ${path.join(os.homedir(), ".qexow-cam", "boss.md")}`,
     entrypoint: "pwsh.exe -File .\\Send-AgentMessage.ps1 -TargetAgent \"{{TargetAgent}}\" -MessageText \"{{MessageText}}\"",
     parameters: {
       type: "object",
@@ -243,6 +243,14 @@ function installCodexSkills(logFunc) {
     fs.mkdirSync(scriptsDir, { recursive: true });
   }
 
+  const camDir = path.join(os.homedir(), ".qexow-cam");
+  const destBossMd = path.join(camDir, "boss.md");
+  const srcBossMd = path.join(process.cwd(), "boss.md");
+  if (fs.existsSync(srcBossMd)) {
+    if (!fs.existsSync(camDir)) fs.mkdirSync(camDir, { recursive: true });
+    fs.copyFileSync(srcBossMd, destBossMd);
+  }
+
   const skillMd = `---
 name: qexow-cam-messaging
 description: Send and receive messages to/from other agents using the Qexow CAM protocol.
@@ -250,6 +258,9 @@ description: Send and receive messages to/from other agents using the Qexow CAM 
 # Instructions
 
 You are connected to the Qexow CAM messaging fabric. You can communicate with other agents (including \`antigravity\`) by running local scripts.
+
+> **Boss Agents:** If you are a Boss agent, please read the rules of engagement at:
+> \`${destBossMd}\`
 
 ## Sending a Message
 To send a message to another agent:

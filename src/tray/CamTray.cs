@@ -44,7 +44,7 @@ namespace CamTray
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Fatal: Failed to extract resources: " + ex.Message, "CAM Resource Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                File.WriteAllText("extract-error.txt", "Fatal: Failed to extract resources: " + ex.Message + "\n" + ex.StackTrace);
                 Environment.Exit(1);
             }
         }
@@ -190,11 +190,24 @@ namespace CamTray
         private TableLayoutPanel grid;
         private TableLayoutPanel mappingsGrid;
         private TextBox txtLogReadout;
+        private System.Windows.Forms.Timer statusTimer;
+        private bool lastDaemonState = false;
 
         public TrayApplicationContext()
         {
             InitializeContext();
             EnsureDaemonRunning();
+            
+            // Check status immediately to set correct initial icon and start auto-refreshing
+            UpdateDaemonStatusIcon();
+            
+            statusTimer = new System.Windows.Forms.Timer();
+            statusTimer.Interval = 2000;
+            statusTimer.Tick += (s, e) => UpdateDaemonStatusIcon();
+            statusTimer.Start();
+
+            // Auto-launch the status window on startup (non-blocking)
+            ShowStatusDialog();
         }
 
         private void InitializeContext()
@@ -209,7 +222,7 @@ namespace CamTray
             // Initialize Tray Icon
             trayIcon = new NotifyIcon()
             {
-                Icon = SystemIcons.Shield,
+                Icon = CreateStatusIcon(false),
                 ContextMenuStrip = contextMenu,
                 Visible = true,
                 Text = "Qexow CAM"
@@ -218,26 +231,75 @@ namespace CamTray
             trayIcon.DoubleClick += Status_Click;
         }
 
-        private void EnsureDaemonRunning()
+        private bool IsDaemonRunning()
         {
             try
             {
                 using (var client = new System.Net.Sockets.TcpClient())
                 {
                     var result = client.BeginConnect("127.0.0.1", 37631, null, null);
-                    bool success = result.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(1));
+                    bool success = result.AsyncWaitHandle.WaitOne(TimeSpan.FromMilliseconds(500));
                     if (success)
                     {
                         client.EndConnect(result);
-                        return; // Daemon is already running
+                        return true;
                     }
                 }
             }
             catch {}
+            return false;
+        }
 
-            // If we reach here, daemon is not running on port 37631, so start it
-            string output = RunCamCommand("daemon start");
-            Console.WriteLine("Auto-started daemon: " + output);
+        private void UpdateDaemonStatusIcon()
+        {
+            bool running = IsDaemonRunning();
+            if (running != lastDaemonState || trayIcon.Icon == null)
+            {
+                lastDaemonState = running;
+                var oldIcon = trayIcon.Icon;
+                trayIcon.Icon = CreateStatusIcon(running);
+                if (oldIcon != null && oldIcon != SystemIcons.Shield)
+                {
+                    try { oldIcon.Dispose(); } catch {}
+                }
+            }
+        }
+
+        private Icon CreateStatusIcon(bool running)
+        {
+            try
+            {
+                using (Bitmap bmp = new Bitmap(16, 16))
+                {
+                    using (Graphics g = Graphics.FromImage(bmp))
+                    {
+                        g.Clear(Color.Transparent);
+                        Color fill = running ? Color.LimeGreen : Color.Crimson;
+                        using (Brush b = new SolidBrush(fill))
+                        {
+                            g.FillEllipse(b, 1, 1, 14, 14);
+                        }
+                        using (Pen p = new Pen(Color.FromArgb(40, 40, 60), 1.5f))
+                        {
+                            g.DrawEllipse(p, 1, 1, 14, 14);
+                        }
+                    }
+                    return Icon.FromHandle(bmp.GetHicon());
+                }
+            }
+            catch
+            {
+                return SystemIcons.Shield;
+            }
+        }
+
+        private void EnsureDaemonRunning()
+        {
+            if (!IsDaemonRunning())
+            {
+                string output = RunCamCommand("daemon start");
+                Console.WriteLine("Auto-started daemon: " + output);
+            }
         }
 
         private void Status_Click(object sender, EventArgs e)
@@ -434,7 +496,7 @@ namespace CamTray
             RefreshAgentMappingsList();
             RefreshLogReadout();
 
-            statusForm.ShowDialog();
+            statusForm.Show();
         }
 
         private void RefreshStatusList()
@@ -555,6 +617,8 @@ namespace CamTray
             if (label.Contains("Codex Desktop App")) return true;
             if (label.Contains("Codex CLI")) return true;
             if (label.Contains("Codex auth")) return !ok;
+            if (label.Contains("Messaging Skill")) return !ok;
+            if (label.Contains("Boss Agent Prompt")) return !ok;
             return false;
         }
 
@@ -568,6 +632,7 @@ namespace CamTray
             if (label.Contains("Codex Desktop App")) return ok ? "Open" : "Download";
             if (label.Contains("Codex CLI")) return ok ? "Update" : "Install";
             if (label.Contains("Codex auth")) return "Login";
+            if (label.Contains("Messaging Skill") || label.Contains("Boss Agent Prompt")) return "Install";
             return "Action";
         }
 
@@ -598,12 +663,8 @@ namespace CamTray
             {
                 if (label.Contains("agy CLI in PATH"))
                 {
-                    ProcessStartInfo psi = new ProcessStartInfo("powershell.exe", "-NoExit -Command \"irm https://antigravity.google/cli/install.ps1 | iex\"")
-                    {
-                        UseShellExecute = true,
-                        WindowStyle = ProcessWindowStyle.Normal
-                    };
-                    try { Process.Start(psi); } catch (Exception ex) { MessageBox.Show("Failed to launch installer: " + ex.Message); }
+                    MessageBox.Show("Please install or re-install the Antigravity Desktop app. It will automatically add 'agy' to your PATH.", "Missing agy CLI");
+                    Process.Start("https://antigravity.google/download");
                 }
                 else
                 {
@@ -621,9 +682,22 @@ namespace CamTray
             }
             else if (label.Contains("CAM daemon"))
             {
-                if (ok) RunCamCommand("daemon stop");
-                else RunCamCommand("daemon start");
+                if (ok)
+                {
+                    string output = RunCamCommand("daemon stop");
+                    Console.WriteLine("Stopped daemon: " + output);
+                }
+                else
+                {
+                    string output = RunCamCommand("daemon start");
+                    Console.WriteLine("Started daemon: " + output);
+                }
                 RefreshStatusList();
+            }
+            else if (label.Contains("Messaging Skill") || label.Contains("Boss Agent Prompt"))
+            {
+                string output = RunCamCommand("install-skills");
+                Console.WriteLine("Ran install-skills: " + output);
             }
             else if (label.Contains("Codex Desktop App"))
             {
@@ -878,40 +952,102 @@ namespace CamTray
             return result;
         }
 
-        private async void RunStatusTest(string agentName, string conversationId, Button btnTest)
+        private void RunStatusTest(string agentName, string conversationId, Button btnTest)
         {
-            btnTest.Enabled = false;
-            btnTest.Text = "Testing...";
-            btnTest.BackColor = Color.Orange;
+            Form testForm = new Form();
+            testForm.Text = "Testing Agent Chat Connection: " + agentName;
+            testForm.Size = new Size(650, 450);
+            testForm.StartPosition = FormStartPosition.CenterParent;
+            testForm.BackColor = Color.FromArgb(20, 20, 30);
+            testForm.ForeColor = Color.White;
+            testForm.Font = new Font("Segoe UI", 9.5f);
+            testForm.MaximizeBox = false;
+            testForm.MinimizeBox = false;
 
-            try
+            TableLayoutPanel layout = new TableLayoutPanel();
+            layout.Dock = DockStyle.Fill;
+            layout.Padding = new Padding(15);
+            layout.RowCount = 5;
+            layout.ColumnCount = 1;
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F)); // Stage 1 (Sent)
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F)); // Stage 2 (Awaiting)
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 20F)); // Title for Response
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F)); // Response Box
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 50F)); // Action/Status Row
+            testForm.Controls.Add(layout);
+
+            Label lblStage1 = new Label() { Text = "● Message Sent: \"what is your status\"", ForeColor = Color.Yellow, Font = new Font("Segoe UI", 9.5f, FontStyle.Bold), Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft };
+            Label lblStage2 = new Label() { Text = "○ Awaiting response...", ForeColor = Color.DarkGray, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft };
+            Label lblResponseTitle = new Label() { Text = "Response details:", ForeColor = Color.FromArgb(0, 162, 232), Dock = DockStyle.Fill, TextAlign = ContentAlignment.BottomLeft };
+
+            TextBox txtResponse = new TextBox()
             {
-                string output = RunCamCommand("send " + agentName + " \"what is your status\"");
-                if (output.Contains("Error"))
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Vertical,
+                BackColor = Color.FromArgb(10, 10, 15),
+                ForeColor = Color.LightGreen,
+                Font = new Font("Consolas", 9f),
+                Dock = DockStyle.Fill
+            };
+
+            Panel bottomBar = new Panel() { Dock = DockStyle.Fill };
+            Label lblResult = new Label() { Text = "RUNNING TEST...", ForeColor = Color.Orange, Font = new Font("Segoe UI", 11f, FontStyle.Bold), AutoSize = true, Location = new Point(0, 10) };
+            Button btnCloseTest = new Button() { Text = "Close", FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(48, 48, 64), ForeColor = Color.White, Size = new Size(100, 30), Location = new Point(500, 5), Enabled = false };
+            btnCloseTest.Click += (s, e) => testForm.Close();
+
+            bottomBar.Controls.Add(lblResult);
+            bottomBar.Controls.Add(btnCloseTest);
+
+            layout.Controls.Add(lblStage1, 0, 0);
+            layout.Controls.Add(lblStage2, 0, 1);
+            layout.Controls.Add(lblResponseTitle, 0, 2);
+            layout.Controls.Add(txtResponse, 0, 3);
+            layout.Controls.Add(bottomBar, 0, 4);
+
+            testForm.Shown += async (s, e) =>
+            {
+                lblStage1.ForeColor = Color.LimeGreen;
+                lblStage1.Text = "✔ Message Sent: \"what is your status\"";
+                lblStage2.ForeColor = Color.Yellow;
+                lblStage2.Text = "● Awaiting response...";
+
+                await System.Threading.Tasks.Task.Delay(500);
+
+                string output = "";
+                bool success = false;
+                try
                 {
-                    btnTest.Text = "Failed!";
-                    btnTest.BackColor = Color.Red;
+                    output = await System.Threading.Tasks.Task.Run(() => RunCamCommand("send " + agentName + " \"what is your status\""));
+                    success = !output.Contains("Error") && !output.ToLower().Contains("failed");
+                }
+                catch (Exception ex)
+                {
+                    output = "Exception: " + ex.Message;
+                    success = false;
+                }
+
+                if (testForm.IsDisposed) return;
+
+                txtResponse.Text = output;
+                if (success)
+                {
+                    lblStage2.ForeColor = Color.LimeGreen;
+                    lblStage2.Text = "✔ Response received!";
+                    lblResult.Text = "RESULT: PASS";
+                    lblResult.ForeColor = Color.LimeGreen;
                 }
                 else
                 {
-                    btnTest.Text = "Success!";
-                    btnTest.BackColor = Color.LimeGreen;
+                    lblStage2.ForeColor = Color.Red;
+                    lblStage2.Text = "✖ Test failed or timed out.";
+                    lblResult.Text = "RESULT: FAIL";
+                    lblResult.ForeColor = Color.Red;
                 }
-            }
-            catch
-            {
-                btnTest.Text = "Failed!";
-                btnTest.BackColor = Color.Red;
-            }
+                btnCloseTest.Enabled = true;
+            };
 
-            await System.Threading.Tasks.Task.Delay(3000);
-            
-            if (btnTest != null && !btnTest.IsDisposed)
-            {
-                btnTest.Text = "Test";
-                btnTest.BackColor = Color.FromArgb(0, 122, 204);
-                btnTest.Enabled = true;
-            }
+            testForm.ShowDialog(statusForm);
         }
 
         private string RunAgyCommand(string arguments)
@@ -951,14 +1087,14 @@ namespace CamTray
 
         private void Start_Click(object sender, EventArgs e)
         {
-            string output = RunCamCommand("daemon start");
-            MessageBox.Show(output, "Start CAM Daemon", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            RunCamCommand("daemon start");
+            RefreshStatusList();
         }
 
         private void Stop_Click(object sender, EventArgs e)
         {
-            string output = RunCamCommand("daemon stop");
-            MessageBox.Show(output, "Stop CAM Daemon", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            RunCamCommand("daemon stop");
+            RefreshStatusList();
         }
 
         private void Exit_Click(object sender, EventArgs e)

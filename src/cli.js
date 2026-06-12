@@ -226,6 +226,15 @@ async function commandDoctor() {
   } catch (error) {
     row(false, "CAM daemon running", `${error.message} — run: cam daemon start`);
   }
+  // ── SKILLS ──────────────────────────────────────────────────────────────────
+  header("QEXOW CAM SKILLS");
+  const agySkillDir = path.join(os.homedir(), ".gemini", "antigravity", "skills", "qexow-cam-messaging");
+  const codexSkillDir = path.join(os.homedir(), ".codex", "skills", "qexow-cam-messaging");
+  const bossMdDest = path.join(p.root, "boss.md");
+  
+  row(fs.existsSync(agySkillDir), "Antigravity Messaging Skill", agySkillDir);
+  row(fs.existsSync(codexSkillDir), "Codex Messaging Skill", codexSkillDir);
+  row(fs.existsSync(bossMdDest), "Boss Agent Prompt", bossMdDest);
 
   // ── INSTALLATION ASSISTANCE ────────────────────────────────────────────────
   const missing = [];
@@ -962,6 +971,11 @@ export async function main(args) {
   if (cmd === "init") {
     const config = initConfig();
     console.log(JSON.stringify({ config, paths: allPaths() }, null, 2));
+    return;
+  }
+  if (cmd === "install-skills") {
+    const { bootstrapAntigravity } = await import("./antigravity.js");
+    bootstrapAntigravity((type, payload) => console.log(`[${type}] ${payload.message}`));
     return;
   }
   if (cmd === "doctor") return commandDoctor();
