@@ -1009,6 +1009,10 @@ export async function main(args) {
     const { runDaemon } = await import("./daemon.js");
     return runDaemon();
   }
+  if (cmd === "tray") {
+    const { runTray } = await import("./tray.js");
+    return runTray();
+  }
   if (cmd === "agent") return commandAgent(rest);
   if (cmd === "send") return commandSend(rest);
   if (cmd === "tunnel") return commandTunnel(rest);
@@ -1018,3 +1022,4 @@ export async function main(args) {
   if (cmd === "install-service" || cmd === "uninstall-service") return commandService(cmd, rest);
   throw new Error(`unknown command: ${cmd}\n${usage()}`);
 }
+

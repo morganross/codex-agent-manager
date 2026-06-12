@@ -343,7 +343,119 @@ export class AgentManagerDaemon {
     this.log("daemon.shutdown.complete");
   }
 
+  #serveStatusUI(req, res) {
+    const config = this.config;
+    const agents = listAgents(config);
+    const uptime = Math.floor((Date.now() - new Date(this.startedAt).getTime()) / 1000);
+    const uptimeStr = uptime < 60 ? `${uptime}s` : uptime < 3600 ? `${Math.floor(uptime/60)}m ${uptime%60}s` : `${Math.floor(uptime/3600)}h ${Math.floor((uptime%3600)/60)}m`;
+    
+    // Read last 50 lines of daemon log
+    let logLines = [];
+    try {
+      const logFile = paths().daemonLog;
+      if (fs.existsSync(logFile)) {
+        const raw = fs.readFileSync(logFile, "utf8");
+        logLines = raw.split(/\r?\n/).filter(Boolean).slice(-50);
+      }
+    } catch (_) {}
+
+    const agentRows = agents.map(a => `
+      <tr>
+        <td>${escHtml(a.name)}</td>
+        <td>${escHtml(a.status || "")}</td>
+        <td class="mono">${escHtml(a.threadId || "—")}</td>
+        <td>${escHtml(a.modelProvider || "")}</td>
+        <td>${escHtml(a.model || "")}</td>
+      </tr>`).join("") || `<tr><td colspan="5" class="empty">No agents registered.</td></tr>`;
+
+    const logHtml = logLines.map(l => `<div class="log-line">${escHtml(l)}</div>`).join("") || `<div class="log-line empty">No logs yet.</div>`;
+
+    function escHtml(s) {
+      return String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+    }
+
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="10">
+<title>Qexow CAM Status</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Inter',sans-serif;background:#0d0d1a;color:#e0e0f0;min-height:100vh}
+  header{background:linear-gradient(135deg,#0a0a18 0%,#12122a 100%);border-bottom:1px solid #1e1e3a;padding:18px 28px;display:flex;align-items:center;gap:16px}
+  header .logo{width:36px;height:36px;background:radial-gradient(circle,#00c853 30%,#0d47a1 100%);border-radius:50%;box-shadow:0 0 12px #00c85355}
+  header h1{font-size:1.25rem;font-weight:700;color:#fff;letter-spacing:.5px}
+  header .sub{font-size:.8rem;color:#7878a0;margin-top:2px}
+  .badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:.72rem;font-weight:600;margin-left:10px}
+  .badge.up{background:#00c85320;color:#00c853;border:1px solid #00c85340}
+  .badge.down{background:#f4433620;color:#f44336;border:1px solid #f4433640}
+  main{padding:24px 28px;display:grid;gap:20px}
+  .card{background:#12122a;border:1px solid #1e1e3a;border-radius:12px;overflow:hidden}
+  .card-header{padding:14px 18px;background:#0e0e24;border-bottom:1px solid #1e1e3a;font-size:.82rem;font-weight:600;color:#9090c0;letter-spacing:1px;text-transform:uppercase}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1px;background:#1e1e3a}
+  .stat{background:#12122a;padding:18px 20px}
+  .stat .label{font-size:.72rem;color:#7878a0;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+  .stat .value{font-size:1.4rem;font-weight:700;color:#fff}
+  .stat .value.green{color:#00c853}
+  .stat .value.red{color:#f44336}
+  table{width:100%;border-collapse:collapse;font-size:.84rem}
+  th{padding:10px 14px;text-align:left;color:#7878a0;font-weight:600;font-size:.72rem;text-transform:uppercase;border-bottom:1px solid #1e1e3a}
+  td{padding:10px 14px;border-bottom:1px solid #0e0e24;vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  td.mono{font-family:monospace;font-size:.78rem;color:#a0a0c8}
+  td.empty{color:#5050a0;font-style:italic;text-align:center;padding:20px}
+  .log-area{padding:14px 18px;max-height:260px;overflow-y:auto;background:#080810}
+  .log-line{font-family:monospace;font-size:.75rem;color:#80e0a0;line-height:1.5;white-space:pre-wrap;word-break:break-all}
+  .log-line.empty{color:#5050a0;font-style:italic}
+  .refresh-note{text-align:center;font-size:.7rem;color:#5050a0;padding:12px;border-top:1px solid #1e1e3a}
+  a{color:#4c9eff;text-decoration:none}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo"></div>
+  <div>
+    <h1>Qexow CAM Dashboard <span class="badge up">LIVE</span></h1>
+    <div class="sub">Agent Management System · port ${escHtml(String(config.port))} · node <strong>${escHtml(config.nodeName)}</strong></div>
+  </div>
+</header>
+<main>
+  <div class="card">
+    <div class="stats">
+      <div class="stat"><div class="label">Daemon Status</div><div class="value green">● Running</div></div>
+      <div class="stat"><div class="label">Uptime</div><div class="value">${escHtml(uptimeStr)}</div></div>
+      <div class="stat"><div class="label">Agents</div><div class="value">${agents.length}</div></div>
+      <div class="stat"><div class="label">Started At</div><div class="value" style="font-size:.9rem">${escHtml(this.startedAt)}</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">Registered Agents</div>
+    <table>
+      <thead><tr><th>Name</th><th>Status</th><th>Thread / Session ID</th><th>Provider</th><th>Model</th></tr></thead>
+      <tbody>${agentRows}</tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <div class="card-header">Live Daemon Log (last 50 lines)</div>
+    <div class="log-area">${logHtml}</div>
+  </div>
+
+  <div class="refresh-note">Auto-refreshes every 10 seconds · <a href="/status-ui">Refresh now</a></div>
+</main>
+</body>
+</html>`;
+
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" });
+    res.end(html);
+  }
+
   async #handle(req, res) {
+
     const start = Date.now();
     res.on("finish", () => {
       this.log("http.request.complete", {
@@ -362,6 +474,11 @@ export class AgentManagerDaemon {
           startedAt: this.startedAt,
           appServerInitialized: this.appServer.initialized,
         });
+      }
+
+      // Status UI page — served without auth so the browser can load it after tray click
+      if (req.url === "/status-ui" && req.method === "GET") {
+        return this.#serveStatusUI(req, res);
       }
 
       if (!this.#authorized(req)) return json(res, 401, { ok: false, error: "unauthorized" });

@@ -1,6 +1,6 @@
 [Setup]
 AppName=Qexow CAM
-AppVersion=2.0.4
+AppVersion=2.1.0
 DefaultDirName={pf}\Qexow CAM
 DefaultGroupName=Qexow CAM
 OutputDir=dist
@@ -14,24 +14,31 @@ CloseApplications=no
 
 
 [Files]
+; The ONE executable — cam.exe is a Node.js SEA containing all logic
 Source: "dist\cam.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Systray helper binary (required for tray icon on Windows)
+Source: "dist\tray_windows_release.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Qexow CAM"; Filename: "{app}\cam.exe"
+; Start Menu: opens status window (signals running instance, or launches fresh)
+Name: "{group}\Qexow CAM"; Filename: "{app}\cam.exe"; Parameters: "tray"
 Name: "{group}\Uninstall Qexow CAM"; Filename: "{uninstallexe}"
 
 [Registry]
+; Add install dir to PATH so `cam` works from any terminal
 Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Check: NeedsAddPath(ExpandConstant('{app}'))
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Qexow CAM"; ValueData: "{app}\cam.exe"
+; Launch tray on Windows startup (user-level)
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Qexow CAM"; ValueData: """{app}\cam.exe"" tray"
 
 [UninstallRun]
-Filename: "taskkill"; Parameters: "/F /IM cam.exe"; Flags: runhidden; RunOnceId: "KillCam"
-Filename: "taskkill"; Parameters: "/F /IM cam-core.exe"; Flags: runhidden; RunOnceId: "KillCamCore"
+; Kill tray and daemon cleanly before uninstall
+Filename: "taskkill"; Parameters: "/F /IM cam.exe /T"; Flags: runhidden; RunOnceId: "KillCam"
+Filename: "taskkill"; Parameters: "/F /IM tray_windows_release.exe /T"; Flags: runhidden; RunOnceId: "KillTray"
 Filename: "{app}\cam.exe"; Parameters: "uninstall-service"; Flags: runhidden; RunOnceId: "UninstallService"
 
 [Run]
-Filename: "{app}\cam.exe"; Parameters: "install-service"; Description: "Install background daemon service"; Flags: postinstall runhidden
-Filename: "{app}\cam.exe"; Description: "Launch Qexow CAM Application"; Flags: postinstall nowait
+; After install: start tray (which auto-starts the daemon) — no cmd windows
+Filename: "{app}\cam.exe"; Parameters: "tray"; Description: "Launch Qexow CAM"; Flags: postinstall nowait
 
 [Code]
 function NeedsAddPath(Param: string): boolean;
@@ -52,12 +59,12 @@ function InitializeSetup(): Boolean;
 var
   ResultCode: Integer;
 begin
-  // Force kill any running instances to free file locks
-  Exec('taskkill.exe', '/F /IM cam.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec('taskkill.exe', '/F /IM cam-core.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  
-  // Try to remove the scheduled task if it exists so we can recreate it fresh
+  // Kill any running instances to free file locks before installing
+  Exec('taskkill.exe', '/F /IM cam.exe /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('taskkill.exe', '/F /IM tray_windows_release.exe /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // Remove any old cam-core.exe references (cleanup from old installs)
+  Exec('taskkill.exe', '/F /IM cam-core.exe /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // Remove old scheduled tasks
   Exec('schtasks.exe', '/Delete /TN QexowCam /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  
   Result := True;
 end;

@@ -1,15 +1,17 @@
 #!/usr/bin/env node
 /**
- * Build script for cam.exe using Node.js built-in SEA (Single Executable Application).
- * Replaces the broken `pkg` approach which cannot handle ES Modules / import.meta.
+ * Build script for cam.exe — a Node.js Single Executable Application (SEA).
+ *
+ * Output: dist/cam.exe  — the ONE executable the user installs.
+ *         dist/tray_windows_release.exe — systray helper, installed alongside cam.exe.
  *
  * Steps:
  *  1. Bundle all ES Module source into a single CJS bundle via esbuild
  *  2. Generate a SEA config JSON
  *  3. Run `node --experimental-sea-config` to produce a blob
- *  4. Copy node.exe -> cam.exe
- *  5. Inject the blob into cam.exe using postject
- *  6. Compile cam-tray.exe via the native csc.exe C# compiler
+ *  4. Copy node.exe → dist/cam.exe
+ *  5. Inject the blob into dist/cam.exe using postject
+ *  6. Copy systray2 helper binary to dist/
  */
 
 import { execSync, spawnSync } from "node:child_process";
@@ -34,8 +36,7 @@ function run(cmd, opts = {}) {
 
 // ── Step 1: Bundle with esbuild into a single CJS file ──────────────────────
 console.log("\n[BUILD] Step 1: Bundling with esbuild...");
-run(`npx esbuild bin/cam.js --bundle --platform=node --format=cjs --outfile=dist/cam-bundle.cjs --external:fsevents`);
-run(`npx esbuild src/daemon-entry.js --bundle --platform=node --format=cjs --outfile=dist/daemon-entry.js --external:fsevents`);
+run(`npx esbuild bin/cam.js --bundle --platform=node --format=cjs --outfile=dist/cam-bundle.cjs --external:fsevents --external:systray2`);
 
 // ── Step 2: Write SEA config ─────────────────────────────────────────────────
 console.log("\n[BUILD] Step 2: Writing SEA config...");
@@ -50,29 +51,32 @@ fs.writeFileSync(path.join(DIST, "sea-config.json"), JSON.stringify(seaConfig, n
 console.log("\n[BUILD] Step 3: Generating SEA blob...");
 run(`node --experimental-sea-config dist/sea-config.json`);
 
-// ── Step 4: Copy node.exe to cam-core.exe ─────────────────────────────────────────
-console.log("\n[BUILD] Step 4: Copying node.exe -> dist/cam-core.exe...");
+// ── Step 4: Copy node.exe → dist/cam.exe ─────────────────────────────────────
+console.log("\n[BUILD] Step 4: Copying node.exe -> dist/cam.exe...");
 const nodeExe = process.execPath;
-const camCoreExe = path.join(DIST, "cam-core.exe");
-fs.copyFileSync(nodeExe, camCoreExe);
+const camExe = path.join(DIST, "cam.exe");
+fs.copyFileSync(nodeExe, camExe);
 
-// ── Step 5: Inject blob via postject ─────────────────────────────────────────
-console.log("\n[BUILD] Step 5: Injecting blob into cam-core.exe via postject...");
-run(`npx postject dist/cam-core.exe NODE_SEA_BLOB dist/cam-sea.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 --overwrite`);
+// ── Step 5: Inject blob into cam.exe via postject ─────────────────────────────
+console.log("\n[BUILD] Step 5: Injecting blob into cam.exe via postject...");
+run(`npx postject dist/cam.exe NODE_SEA_BLOB dist/cam-sea.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 --overwrite`);
 
-// ── Step 6: Compile cam.exe via csc.exe ─────────────────────────────────
-console.log("\n[BUILD] Step 6: Compiling cam.exe via native C# compiler with resources...");
-const cscPath = "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe";
-if (fs.existsSync(cscPath)) {
-  run(`"${cscPath}" /target:winexe /out:dist\\cam.exe /resource:dist\\cam-core.exe /resource:dist\\daemon-entry.js /resource:src\\query_threads.py /resource:src\\remote_query_threads.py /resource:src\\remote_query_threads.js src\\tray\\CamTray.cs`);
+// ── Step 6: Copy systray2 helper binary ──────────────────────────────────────
+console.log("\n[BUILD] Step 6: Copying systray2 helper binary...");
+const systrayBin = path.join(ROOT, "node_modules", "systray2", "traybin", "tray_windows_release.exe");
+const systrayDest = path.join(DIST, "tray_windows_release.exe");
+if (fs.existsSync(systrayBin)) {
+  fs.copyFileSync(systrayBin, systrayDest);
+  console.log(`[BUILD] Copied tray_windows_release.exe to dist/`);
 } else {
-  console.warn("[BUILD] WARNING: csc.exe not found, skipping cam.exe compilation.");
+  console.warn("[BUILD] WARNING: tray_windows_release.exe not found in node_modules/systray2/traybin");
 }
 
-// Clean up all dist files except cam.exe
-console.log("\n[BUILD] Step 7: Cleaning up dist directory...");
+// ── Step 7: Clean up intermediate files ──────────────────────────────────────
+console.log("\n[BUILD] Step 7: Cleaning up intermediate dist files...");
+const keep = new Set(["cam.exe", "tray_windows_release.exe"]);
 for (const file of fs.readdirSync(DIST)) {
-  if (file !== "cam.exe") {
+  if (!keep.has(file)) {
     try {
       fs.rmSync(path.join(DIST, file), { recursive: true, force: true });
     } catch (e) {
@@ -82,4 +86,5 @@ for (const file of fs.readdirSync(DIST)) {
 }
 
 console.log("\n[BUILD] ✅ Build complete! Outputs:");
-console.log(`  dist/cam.exe`);
+console.log(`  dist/cam.exe                   — main application (Node.js SEA)`);
+console.log(`  dist/tray_windows_release.exe  — system tray helper`);
