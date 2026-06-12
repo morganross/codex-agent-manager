@@ -1,35 +1,19 @@
 /**
- * src/tray.js — Qexow CAM System Tray (Node.js)
+ * src/tray.js — Qexow CAM System Tray (Node.js, v2.1.2)
  *
- * Replaces the old C# CamTray.exe. Runs as a long-lived process:
- *   cam.exe tray
+ * Runs as: cam.exe tray
  *
- * Responsibilities:
- *  - Show a tray icon (green = daemon running, red = stopped)
- *  - Auto-start the CAM daemon if not already running
- *  - Provide menu: Status (opens browser), Start/Stop Daemon, Exit
- *  - Enforce single-instance via a lock file
- *  - Never spawn visible cmd/powershell windows
+ * Communicates directly with tray_windows_release.exe via JSON stdio protocol
+ * (same protocol as systray2/systray package). This bypasses the broken
+ * __dirname-based binary resolution in the bundled systray2 JS.
  */
+import http from "node:http";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
-import { createServer } from "node:http";
-
-// Resolve paths safely in both SEA and regular Node.js contexts
-function selfDir() {
-  try {
-    const u = import.meta.url;
-    if (u) return path.dirname(fileURLToPath(u));
-  } catch (_) {}
-  // SEA context: use directory of executable
-  return path.dirname(process.execPath);
-}
-
-const SELF_DIR = selfDir();
 
 // ─── Paths ───────────────────────────────────────────────────────────────────
 const CAM_DIR = path.join(os.homedir(), ".qexow-cam");
@@ -47,10 +31,8 @@ function log(level, msg) {
   console.log(line);
   try {
     ensureLogDir();
-    // Rotate if > 2MB
     try {
-      const stat = fs.statSync(LOG_FILE);
-      if (stat.size > 2 * 1024 * 1024) {
+      if (fs.existsSync(LOG_FILE) && fs.statSync(LOG_FILE).size > 2 * 1024 * 1024) {
         fs.renameSync(LOG_FILE, LOG_FILE + ".1");
       }
     } catch (_) {}
@@ -82,24 +64,42 @@ function isDaemonRunning(port) {
 
 // ─── Start daemon ─────────────────────────────────────────────────────────────
 function startDaemon() {
-  log("INFO", "Starting daemon...");
+  log("INFO", "Starting CAM daemon...");
   try {
-    // cam.exe daemon start   → spawns cam.exe daemon-run (detached, hidden)
-    const exe = process.execPath; // This is cam.exe itself (the SEA)
+    const exe = process.execPath; // cam.exe (the SEA itself)
     fs.mkdirSync(path.join(CAM_DIR, "logs"), { recursive: true });
     const daemonLogPath = path.join(CAM_DIR, "logs", "daemon.log");
     const out = fs.openSync(daemonLogPath, "a");
+    const env = { ...process.env };
+    // If no config exists yet, seed CAM_PORT so initConfig() doesn't throw
+    if (!fs.existsSync(CONFIG_FILE)) {
+      env.CAM_PORT = String(DEFAULT_PORT);
+    }
     const child = spawn(exe, ["daemon-run"], {
       detached: true,
       stdio: ["ignore", out, out],
       windowsHide: true,
-      env: process.env,
+      env,
     });
     child.unref();
     log("INFO", `Daemon spawned pid=${child.pid}`);
   } catch (err) {
     log("ERROR", `Failed to start daemon: ${err.message}`);
   }
+}
+
+// ─── Stop daemon via HTTP ─────────────────────────────────────────────────────
+function stopDaemon(port) {
+  log("INFO", "Sending daemon shutdown...");
+  const req = http.request({
+    hostname: "127.0.0.1",
+    port,
+    path: "/shutdown",
+    method: "POST",
+    timeout: 2000,
+  }, () => {});
+  req.on("error", () => {});
+  req.end();
 }
 
 // ─── Open browser status page ─────────────────────────────────────────────────
@@ -121,23 +121,19 @@ function openStatusPage(port) {
 function acquireLock() {
   try {
     fs.mkdirSync(CAM_DIR, { recursive: true });
-    const pid = String(process.pid);
-    // Check if existing lock is still live
     if (fs.existsSync(LOCK_FILE)) {
       const oldPid = parseInt(fs.readFileSync(LOCK_FILE, "utf8").trim(), 10);
       if (oldPid && oldPid !== process.pid) {
         try {
-          // Send signal 0 to check if process is alive
-          process.kill(oldPid, 0);
+          process.kill(oldPid, 0); // throws if process is dead
           log("INFO", `Another tray instance running (pid=${oldPid}), exiting.`);
           process.exit(0);
         } catch (_) {
-          // Process is dead, take over
           log("INFO", `Stale lock from pid=${oldPid}, taking over.`);
         }
       }
     }
-    fs.writeFileSync(LOCK_FILE, pid);
+    fs.writeFileSync(LOCK_FILE, String(process.pid));
     return true;
   } catch (err) {
     log("ERROR", `Lock error: ${err.message}`);
@@ -149,71 +145,182 @@ function releaseLock() {
   try { fs.unlinkSync(LOCK_FILE); } catch (_) {}
 }
 
-// ─── Systray binary path ──────────────────────────────────────────────────────
-function getTrayBinPath() {
+// ─── Generate a valid 16x16 solid-color ICO file ─────────────────────────────
+function createIco(r, g, b) {
+  const width = 16, height = 16;
+  const pixelDataSize = width * height * 4; // 32-bit BGRA
+  const paddedRow = 4; // 16px wide / 8 = 2 bytes, padded to 4
+  const andMaskSize = paddedRow * height;
+  const imageSize = 40 + pixelDataSize + andMaskSize;
+  const buf = Buffer.alloc(6 + 16 + imageSize, 0);
+  let p = 0;
+  buf.writeUInt16LE(0, p); p += 2;
+  buf.writeUInt16LE(1, p); p += 2;
+  buf.writeUInt16LE(1, p); p += 2;
+  buf.writeUInt8(width, p); p++;
+  buf.writeUInt8(height, p); p++;
+  buf.writeUInt8(0, p); p++;
+  buf.writeUInt8(0, p); p++;
+  buf.writeUInt16LE(1, p); p += 2;
+  buf.writeUInt16LE(32, p); p += 2;
+  buf.writeUInt32LE(imageSize, p); p += 4;
+  buf.writeUInt32LE(22, p); p += 4;
+  buf.writeUInt32LE(40, p); p += 4;
+  buf.writeInt32LE(width, p); p += 4;
+  buf.writeInt32LE(height * 2, p); p += 4;
+  buf.writeUInt16LE(1, p); p += 2;
+  buf.writeUInt16LE(32, p); p += 2;
+  buf.writeUInt32LE(0, p); p += 4;
+  buf.writeUInt32LE(pixelDataSize, p); p += 4;
+  buf.writeInt32LE(0, p); p += 4;
+  buf.writeInt32LE(0, p); p += 4;
+  buf.writeUInt32LE(0, p); p += 4;
+  buf.writeUInt32LE(0, p); p += 4;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      buf.writeUInt8(b, p++);
+      buf.writeUInt8(g, p++);
+      buf.writeUInt8(r, p++);
+      buf.writeUInt8(255, p++);
+    }
+  }
+  // AND mask: already zero (buf was zeroed at alloc)
+  return buf.toString("base64");
+}
+
+// ─── Locate the tray binary ───────────────────────────────────────────────────
+function findTrayBin() {
   const binName = "tray_windows_release.exe";
-  // In SEA context: look next to cam.exe (installer puts it there)
+  // 1. Next to cam.exe (installed location — primary)
   const nextToExe = path.join(path.dirname(process.execPath), binName);
   if (fs.existsSync(nextToExe)) return nextToExe;
-  // Dev context: look in node_modules/systray2/traybin
-  const devPath = path.join(SELF_DIR, "..", "node_modules", "systray2", "traybin", binName);
-  if (fs.existsSync(devPath)) return devPath;
-  // Fallback: same dir as this file
-  const here = path.join(SELF_DIR, binName);
-  if (fs.existsSync(here)) return here;
+  // 2. Dev: next to dist/cam.exe
+  const distPath = path.join(path.dirname(process.execPath), binName);
+  if (fs.existsSync(distPath)) return distPath;
+  // 3. Dev: node_modules/systray2/traybin
+  try {
+    const __dir = typeof __dirname !== "undefined"
+      ? __dirname
+      : path.dirname(fileURLToPath(import.meta.url));
+    const devPath = path.join(__dir, "..", "node_modules", "systray2", "traybin", binName);
+    if (fs.existsSync(devPath)) return devPath;
+  } catch (_) {}
   return null;
 }
 
-// ─── Tray icon (base64 ICO embedded inline) ───────────────────────────────────
-// 16x16 green circle ICO, base64-encoded
-const ICO_GREEN_B64 =
-  "AAABAAEAEBAAAAEAIABoBAAAFgAAACgAAAAQAAAAIAAAAAEAIAAAAAAAAAAAABMLAAATCwAAAAAAAAAAAAD" +
-  "///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///" +
-  "8A////AP///wD///8A////AAAA/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD///" +
-  "8A////AP///wD///8AAAAAAAAAAAAAAAAAWv8XAAD/LQAA/ywAAP8rAAD/KwAA/ywAAP8tWv8XAAAAAP//" +
-  "/wD///8A////AAAAAAAAAAAAAP8BAAD/tQAA//8AAP//AAD//wAA//8AAP//AAD/tQAA/wEAAAAA////AP" +
-  "///wD///8AAAAAAAAAAAAA/8UAAP//AAD//wAA//8AAP//AAD//wAA//8AAP/FAAAAAAD///8A////AAAA" +
-  "AAAAAAAAAP8CAAD//wAA//8AAP//AAD//wAA//8AAP//AAD/AgAAAAD///8A////AAAAAAAAAAAAWP/hAA" +
-  "D//wAA//8AAP//AAD//wAA//8AAP//AAD/4Vj/AAAAAAD///8A////AAAAAAAAAAAAAP//AAD//wAA//8A" +
-  "AP//AAD//wAA//8AAP//AAD//wAAAAAA////AP///wAAAAAAAAAAAAD//wAA//8AAP//AAD//wAA//8AAP/" +
-  "/AAD//wAA//8AAAAAA////AP///wAAAAAAAAAAAABY/+EAAP//AAD//wAA//8AAP//AAD//wAA//8AAP/h" +
-  "WP8AAAAAA////AP///wAAAAAAAAAAAAD/AgAA//8AAP//AAD//wAA//8AAP//AAD//wAA/wIAAAAA////AP" +
-  "///wAAAAAAAAAAAAD/xQAA//8AAP//AAD//wAA//8AAP//AAD//wAA/8UAAAAAA////AP///wAAAAAAAAA" +
-  "AAAD/AQAA/7UAAP//AAD//wAA//8AAP//AAD//wAA/7UAAP8BAAAAAP///wD///8AAAAAAAAAAAAAAAD/" +
-  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP///wD///8A////AP///wD///8AAAAAAAAAAAAAAAAAAAAAAAAAA" +
-  "AAAAAAAAAAAAAAAAAAAD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD" +
-  "///8A////AP///wAAAAAAAA==";
+// ─── Direct tray binary protocol (JSON stdio) ─────────────────────────────────
+// The tray_windows_release.exe binary communicates via JSON lines on stdin/stdout.
+// Send: JSON { seq, type, item } to stdin
+// Receive: JSON { seq, type, item } from stdout (click events)
+// Initial message: send the menu definition, receive "ready" back
 
-const ICO_RED_B64 =
-  "AAABAAEAEBAAAAEAIABoBAAAFgAAACgAAAAQAAAAIAAAAAEAIAAAAAAAAAAAABMLAAATCwAAAAAAAAAAAAD" +
-  "///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///" +
-  "8A////AP///wD///8A////AAAA/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD///" +
-  "8A////AP///wD///8AAAAAAAAAAAAAAAAAWv8XAAD/LQAA/ywAAP8rAAD/KwAA/ywAAP8tWv8XAAAAAP//" +
-  "/wD///8A////AAAAAAAAAAAAAP8BAAD/tQAA//8AAP//AAD//wAA//8AAP//AAD/tQAA/wEAAAAA////AP" +
-  "///wD///8AAAAAAAAAAAAA/8UAAP//AAD//wAA//8AAP//AAD//wAA//8AAP/FAAAAAAD///8A////AAAA" +
-  "AAAAAAAAAP8CAAD//wAA//8AAP//AAD//wAA//8AAP//AAD/AgAAAAD///8A////AAAAAAAAAAAAWP/hAA" +
-  "D//wAA//8AAP//AAD//wAA//8AAP//AAD/4Vj/AAAAAAD///8A////AAAAAAAAAAAAAP//AAD//wAA//8A" +
-  "AP//AAD//wAA//8AAP//AAD//wAAAAAA////AP///wAAAAAAAAAAAAD//wAA//8AAP//AAD//wAA//8AAP/" +
-  "/AAD//wAA//8AAAAAA////AP///wAAAAAAAAAAAABY/+EAAP//AAD//wAA//8AAP//AAD//wAA//8AAP/h" +
-  "WP8AAAAAA////AP///wAAAAAAAAAAAAD/AgAA//8AAP//AAD//wAA//8AAP//AAD//wAA/wIAAAAA////AP" +
-  "///wAAAAAAAAAAAAD/xQAA//8AAP//AAD//wAA//8AAP//AAD//wAA/8UAAAAAA////AP///wAAAAAAAAA" +
-  "AAAD/AQAA/7UAAP//AAD//wAA//8AAP//AAD//wAA/7UAAP8BAAAAAP///wD///8AAAAAAAAAAAAAAAD/" +
-  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP///wD///8A////AP///wD///8AAAAAAAAAAAAAAAAAAAAAAAAAA" +
-  "AAAAAAAAAAAAAAAAAAAD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD" +
-  "///8A////AP///wAAAAAAAA==";
+const SEP = { title: "<SEPARATOR>", tooltip: "", checked: false, enabled: false };
 
-function writeIconFile(b64, filePath) {
-  try {
-    fs.writeFileSync(filePath, Buffer.from(b64, "base64"));
-  } catch (_) {}
+class TrayManager {
+  constructor(binPath) {
+    this._bin = binPath;
+    this._proc = null;
+    this._clickHandlers = [];
+    this._seq = 0;
+  }
+
+  start(menu) {
+    return new Promise((resolve, reject) => {
+      log("INFO", `Spawning tray binary: ${this._bin}`);
+      this._proc = spawn(this._bin, [], {
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+      });
+
+      this._proc.on("error", (err) => {
+        log("ERROR", `Tray binary error: ${err.message}`);
+        reject(err);
+      });
+
+      this._proc.on("exit", (code) => {
+        log("INFO", `Tray binary exited: code=${code}`);
+        process.exit(0);
+      });
+
+      // Parse stdout for click events (one JSON per line)
+      let buf = "";
+      this._proc.stdout.setEncoding("utf8");
+      this._proc.stdout.on("data", (chunk) => {
+        buf += chunk;
+        const lines = buf.split("\n");
+        buf = lines.pop();
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const msg = JSON.parse(trimmed);
+            if (msg.type === "action") {
+              for (const handler of this._clickHandlers) {
+                handler(msg);
+              }
+            }
+          } catch (_) {}
+        }
+      });
+
+      this._proc.stderr?.setEncoding("utf8");
+      this._proc.stderr?.on("data", (d) => log("DEBUG", `tray-bin: ${d.trim()}`));
+
+      // Send menu definition to stdin
+      try {
+        const initMsg = JSON.stringify({
+          ...menu,
+          seq_id: ++this._seq,
+        });
+        this._proc.stdin.write(initMsg + "\n");
+        // Consider ready after a short delay
+        setTimeout(() => resolve(), 500);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  updateMenu(menu) {
+    try {
+      const msg = JSON.stringify({ ...menu, seq_id: ++this._seq });
+      this._proc?.stdin?.write(msg + "\n");
+    } catch (_) {}
+  }
+
+  onClick(handler) {
+    this._clickHandlers.push(handler);
+  }
+
+  kill() {
+    try { this._proc?.kill(); } catch (_) {}
+  }
+}
+
+// ─── Build tray menu JSON ─────────────────────────────────────────────────────
+function buildMenu(iconPath, daemonRunning) {
+  return {
+    icon: iconPath,
+    title: "",
+    tooltip: "Qexow CAM",
+    items: [
+      { title: "Open Status Window", tooltip: "Open CAM dashboard in browser", checked: false, enabled: true },
+      SEP,
+      { title: daemonRunning ? "● Daemon Running" : "○ Daemon Stopped", tooltip: "", checked: false, enabled: false },
+      { title: "Start Daemon", tooltip: "Start the CAM daemon", checked: false, enabled: !daemonRunning },
+      { title: "Stop Daemon", tooltip: "Stop the CAM daemon", checked: false, enabled: daemonRunning },
+      SEP,
+      { title: "Exit", tooltip: "Exit Qexow CAM tray", checked: false, enabled: true },
+    ],
+  };
 }
 
 // ─── Main tray entry point ────────────────────────────────────────────────────
 export async function runTray() {
-  log("INFO", "=== Qexow CAM Tray starting ===");
+  log("INFO", "=== Qexow CAM Tray v2.1.2 starting ===");
 
   if (!acquireLock()) {
-    log("ERROR", "Could not acquire lock, another instance may be running.");
+    log("ERROR", "Could not acquire lock.");
     process.exit(1);
   }
 
@@ -222,151 +329,82 @@ export async function runTray() {
   process.on("SIGTERM", () => process.exit(0));
 
   const port = loadPort();
-  log("INFO", `Using CAM daemon port: ${port}`);
+  log("INFO", `CAM port: ${port}`);
 
   // Auto-start daemon if not running
-  const running = await isDaemonRunning(port);
-  if (!running) {
+  let daemonRunning = await isDaemonRunning(port);
+  if (!daemonRunning) {
+    log("INFO", "Daemon not running — starting it now...");
     startDaemon();
-    // Give daemon 2 seconds to start
-    await new Promise((r) => setTimeout(r, 2000));
+    for (let i = 0; i < 10; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      if (await isDaemonRunning(port)) { daemonRunning = true; break; }
+    }
+    log("INFO", daemonRunning ? "Daemon is up." : "Daemon did not start in time (will retry).");
   } else {
     log("INFO", "Daemon already running.");
   }
 
-  // Locate tray binary
-  const trayBin = getTrayBinPath();
+  // Find tray binary
+  const trayBin = findTrayBin();
   if (!trayBin) {
-    log("ERROR", "Could not find tray_windows_release.exe. Cannot show system tray icon.");
-    // Fall back to minimal headless mode: just keep daemon alive
+    log("ERROR", "tray_windows_release.exe not found. Cannot show tray icon.");
+    // Headless: just keep daemon alive
     setInterval(async () => {
-      const alive = await isDaemonRunning(port);
-      if (!alive) {
+      if (!(await isDaemonRunning(port))) {
         log("WARN", "Daemon stopped, restarting...");
         startDaemon();
       }
     }, 10000);
     return;
   }
+  log("INFO", `Tray binary: ${trayBin}`);
 
-  log("INFO", `Using tray binary: ${trayBin}`);
+  // Generate icons as Base64 strings
+  const iconGreen = createIco(0, 200, 0);
+  const iconRed = createIco(200, 0, 0);
 
-  // Write icon files to temp dir
-  const tmpDir = path.join(os.tmpdir(), "qexow-cam-tray");
-  fs.mkdirSync(tmpDir, { recursive: true });
-  const iconGreen = path.join(tmpDir, "icon_green.ico");
-  const iconRed = path.join(tmpDir, "icon_red.ico");
-  writeIconFile(ICO_GREEN_B64, iconGreen);
-  writeIconFile(ICO_RED_B64, iconRed);
+  const tray = new TrayManager(trayBin);
 
-  // Dynamically import systray2
-  let SysTray;
-  try {
-    const mod = await import("systray2");
-    SysTray = mod.default || mod.SysTray || mod;
-  } catch (err) {
-    log("ERROR", `Failed to import systray2: ${err.message}`);
-    process.exit(1);
-  }
-
-  let daemonRunning = await isDaemonRunning(port);
-  const iconPath = daemonRunning ? iconGreen : iconRed;
-
-  const itemStatus = {
-    title: "Open Status Window",
-    tooltip: "Open the CAM status dashboard in your browser",
-    checked: false,
-    enabled: true,
-  };
-  const itemSep = { title: "<SEPARATOR>", tooltip: "", checked: false, enabled: false };
-  const itemStartDaemon = {
-    title: "Start Daemon",
-    tooltip: "Start the CAM background daemon",
-    checked: false,
-    enabled: !daemonRunning,
-  };
-  const itemStopDaemon = {
-    title: "Stop Daemon",
-    tooltip: "Stop the CAM background daemon",
-    checked: false,
-    enabled: daemonRunning,
-  };
-  const itemSep2 = { title: "<SEPARATOR>", tooltip: "", checked: false, enabled: false };
-  const itemExit = {
-    title: "Exit",
-    tooltip: "Exit the Qexow CAM tray application",
-    checked: false,
-    enabled: true,
-  };
-
-  const systray = new SysTray({
-    menu: {
-      icon: iconPath,
-      isTemplateIcon: false,
-      title: "",
-      tooltip: "Qexow CAM",
-      items: [itemStatus, itemSep, itemStartDaemon, itemStopDaemon, itemSep2, itemExit],
-    },
-    debug: false,
-    copyDir: tmpDir,
-  });
-
-  systray.onClick((action) => {
+  tray.onClick((action) => {
     const title = action?.item?.title || "";
+    log("INFO", `Tray click: ${title}`);
     if (title === "Open Status Window") {
       openStatusPage(port);
     } else if (title === "Start Daemon") {
       startDaemon();
     } else if (title === "Stop Daemon") {
-      // Send shutdown to daemon HTTP API
-      try {
-        const req = require("http").request({
-          hostname: "127.0.0.1",
-          port,
-          path: "/shutdown",
-          method: "POST",
-          timeout: 2000,
-        }, () => {});
-        req.on("error", () => {});
-        req.end();
-      } catch (_) {}
-      log("INFO", "Sent daemon shutdown request.");
+      stopDaemon(port);
     } else if (title === "Exit") {
-      log("INFO", "Exit clicked. Stopping tray.");
-      systray.kill(false);
+      log("INFO", "Exit clicked.");
+      tray.kill();
       process.exit(0);
     }
   });
 
-  await systray.ready();
-  log("INFO", "Tray icon displayed successfully.");
+  const iconPath = daemonRunning ? iconGreen : iconRed;
+  try {
+    await tray.start(buildMenu(iconPath, daemonRunning));
+    log("INFO", "Tray icon displayed. CAM is running.");
+  } catch (err) {
+    log("ERROR", `Failed to start tray: ${err.message}`);
+    process.exit(1);
+  }
 
-  // Poll daemon status every 5 seconds and update icon
+  // Auto-open status page on launch
+  setTimeout(async () => {
+    if (daemonRunning || (await isDaemonRunning(port))) {
+      openStatusPage(port);
+    }
+  }, 2000);
+
+  // Poll daemon status every 5s
   setInterval(async () => {
     const nowRunning = await isDaemonRunning(port);
     if (nowRunning !== daemonRunning) {
       daemonRunning = nowRunning;
-      log("INFO", `Daemon status changed: ${daemonRunning ? "running" : "stopped"}`);
-      const newIcon = daemonRunning ? iconGreen : iconRed;
-      try {
-        systray.sendAction({
-          type: "update-menu",
-          item: {
-            ...systray.internalId,
-            icon: newIcon,
-            items: [
-              itemStatus,
-              itemSep,
-              { ...itemStartDaemon, enabled: !daemonRunning },
-              { ...itemStopDaemon, enabled: daemonRunning },
-              itemSep2,
-              itemExit,
-            ],
-          },
-        });
-      } catch (_) {}
-
-      // Auto-restart daemon if it stopped unexpectedly
+      log("INFO", `Daemon state changed: ${daemonRunning ? "running" : "stopped"}`);
+      tray.updateMenu(buildMenu(daemonRunning ? iconGreen : iconRed, daemonRunning));
       if (!daemonRunning) {
         log("WARN", "Daemon stopped unexpectedly. Restarting in 3s...");
         setTimeout(() => startDaemon(), 3000);

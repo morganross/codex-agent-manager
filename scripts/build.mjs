@@ -36,7 +36,7 @@ function run(cmd, opts = {}) {
 
 // ── Step 1: Bundle with esbuild into a single CJS file ──────────────────────
 console.log("\n[BUILD] Step 1: Bundling with esbuild...");
-run(`npx esbuild bin/cam.js --bundle --platform=node --format=cjs --outfile=dist/cam-bundle.cjs --external:fsevents --external:systray2`);
+run(`npx esbuild bin/cam.js --bundle --platform=node --format=cjs --outfile=dist/cam-bundle.cjs --external:fsevents`);
 
 // ── Step 2: Write SEA config ─────────────────────────────────────────────────
 console.log("\n[BUILD] Step 2: Writing SEA config...");
