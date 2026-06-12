@@ -1,16 +1,17 @@
-import { spawn } from "node:child_process";
-import { spawnSync } from "node:child_process";
+import "./security.js";
+import { enforceSpawnBlocks } from "./security.js";
+enforceSpawnBlocks();
 import fs from "node:fs";
 import crypto from "node:crypto";
-import { pyRemoteScript, jsRemoteScript } from "./remote_scripts.js";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
 import { apiRequest } from "./api.js";
 import { allPaths, defaultCodexPath, initConfig, loadConfig } from "./config.js";
-import { readMailbox, listAgents } from "./registry.js";
-import { paths, projectRoot, readJson, writeJsonAtomic } from "./paths.js";
+import { readMailbox, listAgents, loadRegistry, saveRegistry } from "./registry.js";
+import { paths, readJson, writeJsonAtomic } from "./paths.js";
 import { logEvent } from "./logger.js";
 
 function usage() {
@@ -20,17 +21,13 @@ function usage() {
   cam daemon start|stop|status
   cam node enroll <name> --ssh <user@host> --key <path> --remote-root <path>
   cam node list
-  cam agent create <name> --cwd <path> [--thread-id <id>] [--model <id>] [--model-provider <provider>] [--effort <minimal|low|medium|high|xhigh>] [--speed <standard|fast>] [--service-tier <tier>]
+  cam agent create <name> --cwd <path> [--thread-id <id>] [--source <codex|antigravity>] [--model <id>] [--model-provider <provider>] [--effort <minimal|low|medium|high|xhigh>] [--speed <standard|fast>] [--service-tier <tier>]
   cam agent resume <name>
   cam agent set-model <name> [--model <id>] [--model-provider <provider>] [--effort <minimal|low|medium|high|xhigh>] [--speed <standard|fast>] [--service-tier <tier>]
   cam agent list
   cam agent status <name>
   cam agent read <name> [--latest]
   cam send <agent-name> <message> [--from <agent-name>]
-  cam tunnel command <node> [--local-port <port>] [--remote-port <port>]
-  cam tunnel open <node> [--local-port <port>] [--remote-port <port>] [--background]
-  cam tunnel status <port>
-  cam tunnel stop <pid>
   cam inbox [agent-name]
   cam logs
   cam install-service
@@ -244,19 +241,19 @@ async function commandDoctor() {
   if (!hasAppDir && !isUwpInstalled) {
     missing.push({
       name: "Codex Desktop App",
-      command: "winget install OpenAI.Codex"
+      command: "Install Codex Desktop manually outside CAM."
     });
   }
   if (!fs.existsSync(codexBinExe) && codexPath !== "codex") {
     missing.push({
       name: "Codex CLI",
-      command: "npm install -g @openai/codex-cli"
+      command: "Install Codex CLI manually outside CAM."
     });
   }
   if (!ver.ok) {
     missing.push({
       name: "Codex CLI (runnable)",
-      command: "npm install -g @openai/codex-cli"
+      command: "Install or repair Codex CLI manually outside CAM."
     });
   }
   if (!whoami.ok) {
@@ -268,10 +265,10 @@ async function commandDoctor() {
 
   if (missing.length > 0) {
     header("INSTALLATION ASSISTANCE");
-    console.log("Some components are missing or unconfigured. Here is how to get them:");
+    console.log("Some components are missing or unconfigured. Install or authenticate them manually outside CAM:");
     for (const item of missing) {
       console.log(`\n* ${item.name}:`);
-      console.log(`  Run: ${item.command}`);
+      console.log(`  ${item.command}`);
     }
   }
 }
@@ -279,24 +276,14 @@ async function commandDoctor() {
 async function commandDaemon(args) {
   const action = args[0];
   if (action === "start") {
+    const opts = parseOptions(args.slice(1));
     logEvent("cli.daemon.start.initiating");
     initConfig();
-    const node = process.env.CAM_NODE_EXE || process.execPath;
-    const isSea = !node.endsWith("node") && !node.endsWith("node.exe");
-    const daemonScript = path.resolve(typeof __dirname !== "undefined" ? __dirname : path.dirname(fileURLToPath(import.meta.url)), "daemon-entry.js");
-    const spawnArgs = isSea ? ["daemon-run"] : [daemonScript];
-    const out = fs.openSync(paths().daemonLog, "a");
-    const child = spawn(node, spawnArgs, {
-      detached: true,
-      stdio: ["ignore", out, out],
-      windowsHide: true,
-      env: process.env,
-      shell: false,
-    });
-    child.unref();
-    logEvent("cli.daemon.start.complete", { pid: child.pid });
-    console.log(`started daemon pid=${child.pid}`);
-    return;
+    if (opts.headless) process.env.CAM_HEADLESS = "1";
+    const { runDaemon } = await import("./daemon.js");
+    logEvent("cli.daemon.start.complete", { pid: process.pid, inProcess: true });
+    console.log(`started daemon pid=${process.pid}${opts.headless ? " (headless)" : ""}`);
+    return runDaemon();
   }
   if (action === "stop") {
     logEvent("cli.daemon.stop.initiating");
@@ -313,66 +300,6 @@ async function commandDaemon(args) {
   throw new Error("expected daemon start|stop|status");
 }
 
-async function commandTunnel(args) {
-  const action = args[0];
-  logEvent("cli.tunnel.action", { action, args });
-  if (action === "command" || action === "open") {
-    const opts = parseOptions(args.slice(1));
-    const peerName = opts._[0];
-    if (!peerName) throw new Error(`usage: cam tunnel ${action} <node> [--local-port <port>] [--remote-port <port>]`);
-    const peer = readJson(paths().registry, { peers: {} }).peers?.[peerName];
-    if (!peer) throw new Error(`unknown peer node: ${peerName}`);
-    if (peer.transport !== "ssh") throw new Error(`peer ${peerName} is not an SSH peer`);
-    const localPort = Number(opts.localPort || nextTunnelPort());
-    const remotePort = opts.remotePort ? Number(opts.remotePort) : null;
-    if (!remotePort) throw new Error("Remote port must be specified via --remote-port. Fallbacks are disabled.");
-    const ssh = tunnelSshArgs(peer, localPort, remotePort);
-    if (action === "command") {
-      console.log(renderCommand("ssh", ssh));
-      return;
-    }
-    if (opts.background) {
-      const out = fs.openSync(paths().daemonLog, "a");
-      const child = spawn("ssh", ssh, {
-        detached: true,
-        stdio: ["ignore", out, out],
-        windowsHide: true,
-      });
-      child.unref();
-      recordTunnel({ pid: child.pid, peer: peerName, localPort, remotePort, startedAt: new Date().toISOString() });
-      logEvent("cli.tunnel.open.background", { pid: child.pid, peer: peerName, localPort, remotePort });
-      console.log(`started tunnel pid=${child.pid} 127.0.0.1:${localPort} -> ${peerName}:127.0.0.1:${remotePort}`);
-      return;
-    }
-    console.log(`opening tunnel 127.0.0.1:${localPort} -> ${peerName}:127.0.0.1:${remotePort}; press Ctrl+C to close`);
-    await new Promise((resolve, reject) => {
-      const child = spawn("ssh", ssh, { stdio: "inherit", windowsHide: true });
-      child.on("error", reject);
-      child.on("exit", (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`ssh tunnel exited with ${code}`));
-      });
-    });
-    return;
-  }
-  if (action === "status") {
-    const port = Number(args[1]);
-    if (!port) throw new Error("usage: cam tunnel status <port>");
-    const ok = await portOpen("127.0.0.1", port, 2000);
-    console.log(`${ok ? "OK " : "BAD"} 127.0.0.1:${port}`);
-    return;
-  }
-  if (action === "stop") {
-    const pid = Number(args[1]);
-    if (!pid) throw new Error("usage: cam tunnel stop <pid>");
-    logEvent("cli.tunnel.stop.initiating", { pid });
-    stopPid(pid);
-    logEvent("cli.tunnel.stop.complete", { pid });
-    console.log(`stopped tunnel pid=${pid}`);
-    return;
-  }
-  throw new Error("expected tunnel command|open|status|stop");
-}
 
 async function commandAgent(args) {
   const action = args[0];
@@ -389,6 +316,7 @@ async function commandAgent(args) {
       modelProvider: opts.modelProvider || null,
       effort: opts.effort ? normalizeEffort(opts.effort) : null,
       serviceTier: normalizeServiceTier(opts).value,
+      threadSource: opts.source || opts.threadSource || opts["thread-source"] || "codex",
     });
     console.log(JSON.stringify(result.agent, null, 2));
     return;
@@ -525,12 +453,6 @@ async function commandSend(args) {
     console.log(JSON.stringify(result.message, null, 2));
     return;
   } catch (error) {
-    if (!/unknown agent/.test(error.message)) throw error;
-    const routed = sendViaPeer(payload);
-    if (routed) {
-      console.log(routed.trim());
-      return;
-    }
     throw error;
   }
 }
@@ -564,7 +486,8 @@ async function commandLogs() {
 async function commandNode(args) {
   const action = args[0];
   if (action === "list") {
-    const registry = JSON.parse(fs.readFileSync(paths().registry, "utf8"));
+    const config = loadConfig();
+    const registry = loadRegistry(config);
     console.log(JSON.stringify(registry.peers || {}, null, 2));
     return;
   }
@@ -573,249 +496,24 @@ async function commandNode(args) {
     const name = opts._[0];
     if (!name) throw new Error("node name is required");
     if (!opts.ssh) throw new Error("--ssh <user@host> is required");
-    if (!opts.remoteRoot) throw new Error("--remote-root <path> is required");
     const peer = {
       name,
       transport: "ssh",
       ssh: opts.ssh,
       key: opts.key || null,
-      remoteRoot: opts.remoteRoot,
+      remoteRoot: opts.remoteRoot || "auto",
       agents: [],
       enrolledAt: new Date().toISOString(),
     };
-    const listed = listPeerAgents(peer);
-    peer.agents = listed.agents;
-    peer.lastCheckedAt = new Date().toISOString();
-    const registry = readJson(paths().registry, { version: 1, nodeName: loadConfig().nodeName, agents: {}, peers: {} });
+    const config = loadConfig();
+    const registry = loadRegistry(config);
     registry.peers ||= {};
     registry.peers[name] = peer;
-    writeJsonAtomic(paths().registry, registry);
+    saveRegistry(registry);
     console.log(JSON.stringify(peer, null, 2));
     return;
   }
   throw new Error("expected node enroll|list");
-}
-
-function shellQuote(value) {
-  return `'${String(value).replace(/'/g, `'\\''`)}'`;
-}
-
-function sshArgs(peer, command) {
-  const args = ["-o", "StrictHostKeyChecking=no"];
-  if (peer.key) args.push("-i", peer.key);
-  args.push(peer.ssh, command);
-  return args;
-}
-
-function tunnelSshArgs(peer, localPort, remotePort) {
-  const args = ["-o", "StrictHostKeyChecking=no", "-N", "-L", `127.0.0.1:${localPort}:127.0.0.1:${remotePort}`];
-  if (peer.key) args.push("-i", peer.key);
-  args.push(peer.ssh);
-  return args;
-}
-
-function renderCommand(command, args) {
-  return [command, ...args.map(commandQuote)].join(" ");
-}
-
-function commandQuote(value) {
-  const text = String(value);
-  return /[\s"]/u.test(text) ? `"${text.replace(/"/g, '\\"')}"` : text;
-}
-
-function nextTunnelPort() {
-  const config = loadConfig();
-  if (!config.port) {
-    throw new Error("Configuration Error: CAM port is not configured.");
-  }
-  const registry = readJson(paths().registry, { peers: {} });
-  const count = Object.keys(registry.peers || {}).length;
-  return config.port + count + 1;
-}
-
-function recordTunnel(tunnel) {
-  const p = paths();
-  const state = readJson(p.tunnels, { tunnels: [] });
-  state.tunnels ||= [];
-  state.tunnels.push(tunnel);
-  writeJsonAtomic(p.tunnels, state);
-}
-
-function portOpen(host, port, timeoutMs) {
-  return new Promise((resolve) => {
-    const socket = net.createConnection({ host, port });
-    const done = (ok) => {
-      socket.removeAllListeners();
-      socket.destroy();
-      resolve(ok);
-    };
-    socket.setTimeout(timeoutMs);
-    socket.once("connect", () => done(true));
-    socket.once("timeout", () => done(false));
-    socket.once("error", () => done(false));
-  });
-}
-
-function stopPid(pid) {
-  if (process.platform === "win32") {
-    const result = spawnSync("taskkill.exe", ["/PID", String(pid), "/F"], { encoding: "utf8" });
-    if (result.status !== 0) throw new Error((result.stderr || result.stdout).trim());
-    return;
-  }
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch (error) {
-    throw new Error(`could not stop pid ${pid}: ${error.message}`);
-  }
-}
-
-function runSshSync(peer, commandArgs, stdinContent = null, timeoutMs = 30000) {
-  const args = ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5"];
-  if (peer.key) args.push("-i", peer.key);
-  args.push(peer.ssh, ...commandArgs);
-
-  const result = spawnSync("ssh", args, {
-    input: stdinContent || undefined,
-    encoding: "utf8",
-    timeout: timeoutMs
-  });
-
-  if (result.status !== 0) {
-    return { ok: false, stdout: result.stdout, stderr: result.stderr || "ssh exit code " + result.status };
-  }
-  return { ok: true, stdout: result.stdout, stderr: result.stderr };
-}
-
-function listPeerAgents(peer) {
-  const sq = (val) => "'" + String(val).replace(/'/g, "'\\''") + "'";
-  let agents = [];
-  let successStrategy = null;
-
-  // Stage 1: CLI list
-  if (!successStrategy) {
-    const command = `node ${sq(`${peer.remoteRoot}/bin/cam.js`)} agent list`;
-    const result = runSshSync(peer, [command]);
-    if (result.ok) {
-      try {
-        const lines = result.stdout.split(/\r?\n/).filter(Boolean);
-        const list = [];
-        for (const line of lines) {
-          const fields = line.split("\t");
-          if (fields.length >= 1 && fields[0]) {
-            list.push(fields[0]);
-          }
-        }
-        if (list.length > 0) {
-          agents = list;
-          successStrategy = "cli";
-        }
-      } catch (e) {}
-    }
-  }
-
-  // Stage 2: Registry JSON file read
-  if (!successStrategy) {
-    const command = `cat ~/.qexow-cam/agents.json`;
-    const result = runSshSync(peer, [command]);
-    if (result.ok) {
-      try {
-        const registry = JSON.parse(result.stdout);
-        if (registry && registry.agents) {
-          agents = Object.keys(registry.agents);
-          successStrategy = "registry";
-        }
-      } catch (e) {}
-    }
-  }
-
-  // Scripts are now imported from remote_scripts.js
-
-  // Stage 3: Python direct query
-  if (!successStrategy) {
-    const result = runSshSync(peer, ["python3"], pyRemoteScript);
-    if (result.ok) {
-      try {
-        const data = JSON.parse(result.stdout);
-        if (data.threads) {
-          const normalizeName = (text) => {
-            if (!text) return "";
-            return text
-              .toLowerCase()
-              .replace(/[^a-z0-9\s-]/g, "")
-              .trim()
-              .replace(/[\s_]+/g, "-")
-              .replace(/-+/g, "-")
-              .replace(/^-+|-+$/g, "");
-          };
-          agents = data.threads.map(t => {
-            let name = normalizeName(t.title);
-            if (!name) name = `agent-${t.id.substring(0, 8)}`;
-            return name;
-          });
-          successStrategy = "python";
-        }
-      } catch (e) {}
-    }
-  }
-
-  // Stage 4: Node.js direct query
-  if (!successStrategy) {
-    const result = runSshSync(peer, ["node -e " + sq("eval(require('fs').readFileSync(0, 'utf-8'))")], jsRemoteScript);
-    if (result.ok) {
-      try {
-        const data = JSON.parse(result.stdout);
-        if (data.threads) {
-          const normalizeName = (text) => {
-            if (!text) return "";
-            return text
-              .toLowerCase()
-              .replace(/[^a-z0-9\s-]/g, "")
-              .trim()
-              .replace(/[\s_]+/g, "-")
-              .replace(/-+/g, "-")
-              .replace(/^-+|-+$/g, "");
-          };
-          agents = data.threads.map(t => {
-            let name = normalizeName(t.title);
-            if (!name) name = `agent-${t.id.substring(0, 8)}`;
-            return name;
-          });
-          successStrategy = "node";
-        }
-      } catch (e) {}
-    }
-  }
-
-  if (!successStrategy) {
-    return { ok: false, agents: [], error: "failed to list agents using all discovery strategies" };
-  }
-
-  return { ok: true, agents };
-}
-
-
-function sendViaPeer(payload) {
-  const registry = readJson(paths().registry, { peers: {} });
-  for (const peer of Object.values(registry.peers || {})) {
-    if (!peer.agents?.includes(payload.targetAgent)) continue;
-    const command = [
-      "node",
-      shellQuote(`${peer.remoteRoot}/bin/cam.js`),
-      "send",
-      shellQuote(payload.targetAgent),
-      shellQuote(payload.message),
-      "--from",
-      shellQuote(payload.sourceAgent),
-      "--source-node",
-      shellQuote(payload.sourceNode),
-    ].join(" ");
-    const result = spawnSync("ssh", sshArgs(peer, command), { encoding: "utf8", timeout: 120000 });
-    if (result.status !== 0) {
-      throw new Error(`peer send failed via ${peer.name}: ${(result.stderr || result.stdout).trim()}`);
-    }
-    return result.stdout;
-  }
-  return null;
 }
 
 async function commandService(cmd, args) {
@@ -823,167 +521,15 @@ async function commandService(cmd, args) {
   initConfig();
   const opts = parseOptions(args);
   const name = opts.name || "QexowCam";
-  if (process.platform === "win32") {
-    return cmd === "install-service" ? installWindowsTask(name) : uninstallWindowsTask(name);
-  }
-  return cmd === "install-service" ? installSystemdUserService(name) : uninstallSystemdUserService(name);
-}
-
-function daemonScriptPath() {
-  return path.resolve(path.dirname(process.execPath), "daemon-entry.js");
-}
-
-function daemonNodePath() {
-  return process.env.CAM_NODE_EXE || process.execPath;
-}
-
-function installWindowsTask(name) {
-  const node = daemonNodePath();
-  const isSea = !node.endsWith("node") && !node.endsWith("node.exe");
-  const args = isSea ? `"daemon-run"` : `"${daemonScriptPath()}"`;
-  const taskCommand = `"${node}" ${args}`;
-  const create = spawnSync("schtasks.exe", [
-    "/Create",
-    "/F",
-    "/TN",
+  const headless = !!opts.headless;
+  const serviceFile = path.join(paths().root, "service.json");
+  writeJsonAtomic(serviceFile, {
     name,
-    "/SC",
-    "ONLOGON",
-    "/RL",
-    "LIMITED",
-    "/TR",
-    taskCommand,
-  ], { encoding: "utf8", windowsHide: true });
-  if (create.status !== 0) {
-    installWindowsStartupFallback(name);
-    console.log(`installed Startup folder fallback because scheduled task creation failed: ${(create.stderr || create.stdout).trim()}`);
-    return;
-  }
-  console.log((create.stdout || "").trim());
-  console.log(`installed Windows logon task ${name}; use 'cam daemon start' for the current session`);
-}
-
-function uninstallWindowsTask(name) {
-  const result = spawnSync("schtasks.exe", ["/Delete", "/TN", name, "/F"], { encoding: "utf8", windowsHide: true });
-  uninstallWindowsStartupFallback(name);
-  if (result.status === 0) console.log((result.stdout || "").trim());
-  else console.log(`scheduled task was not removed or did not exist: ${(result.stderr || result.stdout).trim()}`);
-}
-
-function installWindowsStartupFallback(name) {
-  const startupDir = path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "Microsoft", "Windows", "Start Menu", "Programs", "Startup");
-  fs.mkdirSync(startupDir, { recursive: true });
-  const file = path.join(startupDir, `${name}.cmd`);
-  const node = daemonNodePath();
-  const isSea = !node.endsWith("node") && !node.endsWith("node.exe");
-  const args = isSea ? `"daemon-run"` : `"${daemonScriptPath()}"`;
-  const lines = [
-    "@echo off",
-    `set CAM_HOME=${paths().root}`,
-    `set CODEX_HOME=${loadConfig().codexHome}`,
-    `start "" /min "${node}" ${args}`,
-    "",
-  ];
-  fs.writeFileSync(file, lines.join("\r\n"), "utf8");
-}
-
-function uninstallWindowsStartupFallback(name) {
-  const startupDir = path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "Microsoft", "Windows", "Start Menu", "Programs", "Startup");
-  const file = path.join(startupDir, `${name}.cmd`);
-  if (fs.existsSync(file)) fs.rmSync(file);
-}
-
-function installSystemdUserService(name) {
-  const unitName = systemdUnitName(name);
-  const unitDir = path.join(os.homedir(), ".config", "systemd", "user");
-  fs.mkdirSync(unitDir, { recursive: true });
-  const unitPath = path.join(unitDir, unitName);
-  const env = [
-    `CAM_HOME=${paths().root}`,
-    `CODEX_HOME=${loadConfig().codexHome}`,
-  ];
-  const node = daemonNodePath();
-  const isSea = !node.endsWith("node") && !node.endsWith("node.exe");
-  const args = isSea ? `daemon-run` : systemdEscape(daemonScriptPath());
-  const unit = [
-    "[Unit]",
-    "Description=Qexow CAM Daemon",
-    "After=network.target",
-    "",
-    "[Service]",
-    "Type=simple",
-    `WorkingDirectory=${projectRoot()}`,
-    ...env.map((item) => `Environment=${systemdEscape(item)}`),
-    `ExecStart=${systemdEscape(node)} ${args}`,
-    "Restart=always",
-    "RestartSec=5",
-    "",
-    "[Install]",
-    "WantedBy=default.target",
-    "",
-  ].join("\n");
-  fs.writeFileSync(unitPath, unit, "utf8");
-  const reload = spawnSync("systemctl", ["--user", "daemon-reload"], { encoding: "utf8" });
-  const enable = reload.status === 0
-    ? spawnSync("systemctl", ["--user", "enable", unitName], { encoding: "utf8" })
-    : reload;
-  if (enable.status === 0) {
-    console.log(`installed ${unitPath}; use 'cam daemon start' for the current session`);
-    return;
-  }
-  installCronFallback(name);
-  console.log(`installed cron @reboot fallback because systemd user service was unavailable: ${(enable.stderr || enable.stdout).trim()}`);
-}
-
-function uninstallSystemdUserService(name) {
-  const unitName = systemdUnitName(name);
-  spawnSync("systemctl", ["--user", "disable", "--now", unitName], { encoding: "utf8" });
-  const unitPath = path.join(os.homedir(), ".config", "systemd", "user", unitName);
-  if (fs.existsSync(unitPath)) fs.rmSync(unitPath);
-  spawnSync("systemctl", ["--user", "daemon-reload"], { encoding: "utf8" });
-  uninstallCronFallback(name);
-  console.log(`removed ${unitPath}`);
-}
-
-function installCronFallback(name) {
-  const marker = `# ${name}`;
-  const scriptPath = path.join(paths().root, `${name}.start.sh`);
-  const script = [
-    "#!/usr/bin/env sh",
-    `export CAM_HOME=${shellWord(paths().root)}`,
-    `export CODEX_HOME=${shellWord(loadConfig().codexHome)}`,
-    `cd ${shellWord(projectRoot())} || exit 1`,
-    `${shellWord(daemonNodePath())} ${shellWord(path.join(projectRoot(), "bin", "cam.js"))} daemon start >/dev/null 2>&1`,
-    "",
-  ].join("\n");
-  fs.writeFileSync(scriptPath, script, { mode: 0o700 });
-  const existing = spawnSync("crontab", ["-l"], { encoding: "utf8" });
-  const lines = existing.status === 0 ? existing.stdout.split(/\r?\n/).filter(Boolean) : [];
-  const filtered = lines.filter((line) => !line.includes(marker));
-  filtered.push(`@reboot ${shellWord(scriptPath)} ${marker}`);
-  const update = spawnSync("crontab", ["-"], { input: `${filtered.join("\n")}\n`, encoding: "utf8" });
-  if (update.status !== 0) throw new Error((update.stderr || update.stdout).trim());
-}
-
-function uninstallCronFallback(name) {
-  const marker = `# ${name}`;
-  const existing = spawnSync("crontab", ["-l"], { encoding: "utf8" });
-  if (existing.status !== 0) return;
-  const filtered = existing.stdout.split(/\r?\n/).filter((line) => line && !line.includes(marker));
-  spawnSync("crontab", ["-"], { input: `${filtered.join("\n")}\n`, encoding: "utf8" });
-}
-
-function shellWord(value) {
-  return `'${String(value).replace(/'/g, `'\\''`)}'`;
-}
-
-function systemdUnitName(name) {
-  return `${String(name).replace(/[^A-Za-z0-9_.@-]/g, "-")}.service`;
-}
-
-function systemdEscape(value) {
-  const text = String(value);
-  return /[\s"]/u.test(text) ? `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` : text;
+    headless,
+    enabled: cmd === "install-service",
+    updatedAt: new Date().toISOString(),
+  });
+  console.log(`recorded ${cmd} in ${serviceFile}; start the daemon with 'cam daemon start'`);
 }
 
 export async function main(args) {
@@ -1014,11 +560,9 @@ export async function main(args) {
   }
   if (cmd === "agent") return commandAgent(rest);
   if (cmd === "send") return commandSend(rest);
-  if (cmd === "tunnel") return commandTunnel(rest);
   if (cmd === "inbox") return commandInbox(rest);
   if (cmd === "logs") return commandLogs();
   if (cmd === "node") return commandNode(rest);
   if (cmd === "install-service" || cmd === "uninstall-service") return commandService(cmd, rest);
   throw new Error(`unknown command: ${cmd}\n${usage()}`);
 }
-

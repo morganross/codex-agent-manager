@@ -7,7 +7,7 @@ The manager has two strict boundaries:
 - Codex app-server is started only as `codex app-server --listen stdio://`.
 - The manager HTTP API binds only to `127.0.0.1:37631`.
 
-Remote delivery uses SSH. Do not expose raw Codex app-server or the manager daemon on a public interface.
+Remote peer records are discovered from Codex-managed state. CAM itself does not run SSH, shell scripts, Python helpers, polling scripts, or remote installers.
 
 ## Install
 
@@ -26,13 +26,7 @@ The wrappers use `CAM_NODE_EXE` when set, otherwise they use `node` from `PATH`:
 $env:CAM_NODE_EXE = "C:\path\to\node.exe"
 ```
 
-On Linux nodes:
-
-```bash
-node /home/ubuntu/qexow-cam/bin/cam.js init
-node /home/ubuntu/qexow-cam/bin/cam.js daemon start
-node /home/ubuntu/qexow-cam/bin/cam.js daemon status
-```
+Linux binaries are produced by the release build for packaging and inspection. CAM no longer ships an autonomous remote shell installer.
 
 Install login/reboot persistence:
 
@@ -40,11 +34,7 @@ Install login/reboot persistence:
 .\cam.cmd install-service
 ```
 
-```bash
-node /home/ubuntu/qexow-cam/bin/cam.js install-service
-```
-
-Windows first tries a logon scheduled task and falls back to a no-admin Startup-folder launcher if task creation is denied. Linux installs a user systemd unit when available and falls back to an `@reboot` cron entry if user systemd is unavailable.
+`install-service` records local CAM startup metadata only. It does not create scheduled tasks, systemd units, cron jobs, shell scripts, or hidden helper launchers.
 
 On daemon start, CAM also rehydrates any already-registered agents with saved thread IDs so the next reboot usually needs less manual cleanup.
 
@@ -93,49 +83,9 @@ Reasoning effort accepts `minimal`, `low`, `medium`, `high`, or `xhigh`; `extra-
 
 If delivery through `turn/start` or `turn/steer` fails, the message is saved in a durable mailbox. Queued messages are surfaced into the next successful turn for that target agent.
 
-## SSH Peer Routing
+## Remote Peer Metadata
 
-Enroll a remote node from Windows:
-
-```powershell
-.\cam.cmd node enroll frontend --ssh ubuntu@example.com --key "C:\path\to\private-key.pem" --remote-root /home/ubuntu/qexow-cam
-```
-
-Then send to a named remote agent with the same command shape:
-
-```powershell
-.\cam.cmd send frontend-agent "Reply with your node name and cwd."
-```
-
-The local CLI first tries the local daemon. If the target agent is unknown locally, it checks enrolled SSH peers and runs that peer's local `cam send` command over SSH. This works from the home PC behind NAT because the home PC initiates outbound SSH.
-
-For cloud-to-cloud routing, enroll private-IP peers from nodes that already have an approved SSH key:
-
-```bash
-node /home/ubuntu/qexow-cam/bin/cam.js node enroll searchbox \
-  --ssh ubuntu@10.0.0.10 \
-  --key /path/to/private/key.pem \
-  --remote-root /home/ubuntu/qexow-cam
-```
-
-## SSH Tunnels
-
-Use tunnels when the home PC needs a stable local port through NAT to a cloud node's loopback manager:
-
-```powershell
-.\cam.cmd tunnel command frontend --local-port 37632
-.\cam.cmd tunnel open frontend --local-port 37632 --background
-.\cam.cmd tunnel status 37632
-.\cam.cmd tunnel stop <pid>
-```
-
-That opens:
-
-```text
-127.0.0.1:37632 -> frontend:127.0.0.1:37631
-```
-
-The tunnel is optional for normal `cam send` SSH peer routing. It is useful for diagnostics and future HTTP manager-to-manager transport, while still avoiding public manager ports.
+CAM can list Codex-managed remote peers that already exist in Codex state, but CAM does not contact those machines directly. SSH routing, reverse mailbox polling, exponential backoff polling, and autonomous remote deployment have been removed.
 
 ## Storage
 
@@ -153,7 +103,6 @@ config.json
 agents.json
 mailbox.jsonl
 events.jsonl
-tunnels.json
 logs/daemon.log
 secrets/local-api-token
 ```
@@ -162,46 +111,12 @@ Set `CAM_HOME` to use a different state directory.
 
 ## Determine Active vs Archived Chats
 
-CAM chat lifecycle is tracked in the local thread-state database (`state_*.sqlite`), not just in transcript folders.
+CAM discovers local Codex chats from Codex-managed JSON state and session metadata. It does not run Python or external database inspection helpers.
 
-- Active chats: `archived = 0`
-- Archived chats: `archived = 1`
-
-Run from PowerShell (adjust path if your CAM home is different):
-
-```powershell
-$db = "$env:USERPROFILE\.codex\state_5.sqlite"
-$script = @'
-import sqlite3
-
-conn = sqlite3.connect(r"__DB__")
-rows = conn.execute(
-    "SELECT id, title, archived, archived_at, updated_at FROM threads ORDER BY archived, updated_at DESC"
-).fetchall()
-for row in rows:
-    print(row)
-'@
-$py = $script -replace '__DB__', ($db -replace '\\', '\\')
-python -c $py
-```
-
-Use the files on disk as a quick visual signal:
+Use the files on disk as a quick visual signal only:
 
 - Active transcripts: `$env:USERPROFILE\.codex\sessions\...`
 - Archived transcripts: `$env:USERPROFILE\.codex\archived_sessions\...`
-
-Count by status:
-
-```powershell
-$db = "$env:USERPROFILE\.codex\state_5.sqlite"
-$script = @'
-import sqlite3
-conn = sqlite3.connect(r"__DB__")
-for r in conn.execute("SELECT archived, COUNT(*) FROM threads GROUP BY archived ORDER BY archived"):
-    print(r)
-'@
-python -c ($script -replace '__DB__', ($db -replace '\\', '\\'))
-```
 
 If your environment has a different `CAM_HOME` path than the default, use the path configured in that environment for `state_*.sqlite` and transcript folders.
 
@@ -210,7 +125,6 @@ If your environment has a different `CAM_HOME` path than the default, use the pa
 - Codex app-server is spawned over stdio only.
 - CLI-to-daemon API binds to `127.0.0.1`.
 - CLI requests require `secrets/local-api-token`.
-- Remote delivery uses SSH command execution or SSH tunnels.
-- Home-PC NAT traversal is outbound SSH from Windows, not inbound public exposure.
+- Remote SSH execution and remote polling are disabled.
 - Tokens, logs, mailbox data, and generated local state are ignored by git.
 - Do not open public ports for Codex app-server or the manager daemon.

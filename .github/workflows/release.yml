@@ -23,7 +23,26 @@ jobs:
     - name: Install dependencies
       run: npm install
 
-    - name: Compile Windows Binaries
+    - name: Download and Extract Linux Base Binaries
+      shell: pwsh
+      run: |
+        $homeDir = [System.Environment]::GetFolderPath('UserProfile')
+        $binDir = Join-Path $homeDir ".bin"
+        New-Item -ItemType Directory -Force -Path $binDir
+
+        # Download and extract Linux x64 Node.js base
+        Write-Host "Downloading Linux x64 base..."
+        $x64Zip = Join-Path $binDir "node-v22.22.3-linux-x64.tar.gz"
+        Invoke-WebRequest -Uri "https://nodejs.org/dist/v22.22.3/node-v22.22.3-linux-x64.tar.gz" -OutFile $x64Zip -ErrorAction Stop
+        tar -xf $x64Zip -C $binDir "node-v22.22.3-linux-x64/bin/node"
+
+        # Download and extract Linux arm64 Node.js base
+        Write-Host "Downloading Linux arm64 base..."
+        $arm64Zip = Join-Path $binDir "node-v22.22.3-linux-arm64.tar.gz"
+        Invoke-WebRequest -Uri "https://nodejs.org/dist/v22.22.3/node-v22.22.3-linux-arm64.tar.gz" -OutFile $arm64Zip -ErrorAction Stop
+        tar -xf $arm64Zip -C $binDir "node-v22.22.3-linux-arm64/bin/node"
+
+    - name: Compile Windows & Linux Binaries
       run: npm run build
 
     - name: Compile Inno Setup Installer
@@ -34,3 +53,7 @@ jobs:
       with:
         files: |
           dist/QexowCamSetup.exe
+          dist/cam.exe
+          dist/cam-linux-x64
+          dist/cam-linux-arm64
+          dist/cam-bundle.cjs

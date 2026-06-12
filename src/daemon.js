@@ -1,13 +1,18 @@
+import "./security.js";
+import { enforceSpawnBlocks } from "./security.js";
+enforceSpawnBlocks();
+
+if (process.argv.includes("--headless")) {
+  process.env.CAM_HEADLESS = "1";
+}
+
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { execFile, execFileSync } from "node:child_process";
 import net from "node:net";
 import { AppServerClient, textInput } from "./app-server.js";
-import { pyRemoteScript, jsRemoteScript } from "./remote_scripts.js";
 import { ensureLocalToken, loadConfig } from "./config.js";
 import {
   appendEvent,
@@ -24,15 +29,12 @@ import {
 } from "./registry.js";
 import { paths, writeJsonAtomic, readJson } from "./paths.js";
 import { logEvent, enforceRetention } from "./logger.js";
-import { bootstrapAntigravity, runAgyCommand, pollAgyTranscript } from "./antigravity.js";
+import { bootstrapAntigravity } from "./antigravity.js";
 
 export function showWindowsAlert(title, message, iconType = "error") {
-  if (process.platform !== "win32") return;
-  const code = iconType === "error" ? 16 : 48;
-  const escapedMessage = String(message).replace(/"/g, '""').replace(/\r?\n/g, '" & vbCrLf & "');
-  const escapedTitle = String(title).replace(/"/g, '""');
-  const vbsCode = `vbscript:Execute("msgbox ""${escapedMessage}"", ${code}, ""${escapedTitle}""")(window.close)`;
-  execFile("mshta", [vbsCode], { windowsHide: true }, () => {});
+  // Completely disabled by Security Block 5: Eradication of External Scripts
+  // We do not use VBScript or mshta.exe ever.
+  return;
 }
 
 export function showYesNoDialog(title, message) {
@@ -91,35 +93,6 @@ export async function killProcessOnPort(port, host) {
       return true;
     }
     await new Promise((r) => setTimeout(r, 100));
-  }
-  
-  // Force kill fallback if on Windows
-  if (process.platform === "win32") {
-    try {
-      const netstatOut = execFileSync("netstat", ["-ano"], { encoding: "utf8", windowsHide: true });
-      const lines = netstatOut.split(/\r?\n/);
-      const portRegex = new RegExp(`:${port}\\s+.*LISTENING\\s+(\\d+)`, "i");
-      let pidToKill = null;
-      for (const line of lines) {
-        const match = line.match(portRegex);
-        if (match) {
-          pidToKill = match[1];
-          break;
-        }
-      }
-      if (pidToKill) {
-        execFileSync("taskkill", ["/F", "/PID", pidToKill], { windowsHide: true });
-        // Wait up to 1.0s for the port to be released
-        for (let i = 0; i < 10; i++) {
-          if (!(await isPortInUse(port, host))) {
-            return true;
-          }
-          await new Promise((r) => setTimeout(r, 100));
-        }
-      }
-    } catch (err) {
-      // Ignore errors finding or killing the process
-    }
   }
   
   return !(await isPortInUse(port, host));
@@ -202,10 +175,7 @@ export class AgentManagerDaemon {
     this.threadToAgent = new Map();
     this.ensuringThreads = new Map();
     this.mailboxListeners = [];
-
-    // Load remote query scripts (bundled via esbuild)
-    this.pyRemoteScript = pyRemoteScript;
-    this.jsRemoteScript = jsRemoteScript;
+    this.threadSyncInterval = null;
   }
 
   queueMessage(message) {
@@ -222,6 +192,8 @@ export class AgentManagerDaemon {
 
   log(type, payload = {}) {
     logEvent(type, payload);
+    // VBScript message box popups are disabled to prevent recursive process storms.
+    /*
     if (type.includes("error") || type.includes("failed")) {
       const msg = payload.error || payload.message || JSON.stringify(payload);
       showWindowsAlert(`CAM Daemon Error [${type}]`, msg, "error");
@@ -229,10 +201,12 @@ export class AgentManagerDaemon {
       const msg = payload.warn || payload.warning || payload.message || JSON.stringify(payload);
       showWindowsAlert(`CAM Daemon Warning [${type}]`, msg, "warning");
     }
+    */
   }
 
   async start() {
-    enforceRetention();
+    try {
+      enforceRetention();
     this.log("daemon.startup.initiating", { port: this.config.port, bindHost: this.config.bindHost, nodeName: this.config.nodeName });
     const port = this.config.port;
     const host = this.config.bindHost || "127.0.0.1";
@@ -252,13 +226,33 @@ export class AgentManagerDaemon {
       }
     }
 
-    // Initialize Native Antigravity Integration
+    // Bind HTTP server immediately to satisfy health checks during slow initial bootstrap
+    this.server = http.createServer((req, res) => this.#handle(req, res));
+    await new Promise((resolve, reject) => {
+      this.server.once("error", reject);
+      this.server.listen(this.config.port, this.config.bindHost, resolve);
+    });
+    writeJsonAtomic(paths().daemon, {
+      pid: process.pid,
+      nodeName: this.config.nodeName,
+      url: `http://${this.config.bindHost}:${this.config.port}`,
+      startedAt: this.startedAt,
+      codexPath: this.config.codexPath,
+    });
+    fs.writeFileSync(paths().pid, String(process.pid));
+    this.log("daemon.started", { pid: process.pid, url: `http://${this.config.bindHost}:${this.config.port}` });
+
+    // Initialize Native Antigravity Integration after binding port
     bootstrapAntigravity((type, payload) => this.log(type, payload));
 
     await this.appServer.start();
     for (const agent of listAgents(this.config)) {
       if (agent.threadId) this.threadToAgent.set(agent.threadId, agent.name);
     }
+    await this.syncActiveThreads();
+    this.threadSyncInterval = setInterval(() => {
+      void this.syncActiveThreads();
+    }, 30000);
     this.appServer.on("turn/started", ({ threadId, turn }) => {
       const name = this.threadToAgent.get(threadId);
       if (name) setAgent(this.config, name, { status: "active", activeTurnId: turn.id });
@@ -301,42 +295,19 @@ export class AgentManagerDaemon {
       }
     });
 
-    this.server = http.createServer((req, res) => this.#handle(req, res));
-    await new Promise((resolve, reject) => {
-      this.server.once("error", reject);
-      this.server.listen(this.config.port, this.config.bindHost, resolve);
-    });
-    writeJsonAtomic(paths().daemon, {
-      pid: process.pid,
-      nodeName: this.config.nodeName,
-      url: `http://${this.config.bindHost}:${this.config.port}`,
-      startedAt: this.startedAt,
-      codexPath: this.config.codexPath,
-    });
-    fs.writeFileSync(paths().pid, String(process.pid));
-    this.log("daemon.started", { pid: process.pid, url: `http://${this.config.bindHost}:${this.config.port}` });
-
-    await this.syncActiveThreads();
-    this.syncInterval = setInterval(() => {
-      void this.syncActiveThreads();
-    }, 5000);
-
-    // Initial remote peer sync and interval
-    await this.syncRemotePeers();
-    this.syncRemoteInterval = setInterval(() => {
-      void this.syncRemotePeers();
-    }, 30000);
-
-    void this.#warmKnownAgents();
+    } catch (error) {
+      this.log("daemon.startup.failed_zombie", { error: error.message });
+      console.error("Daemon startup failed. Entering Block 8 Zombified Standby Mode to prevent terminal storms.", error);
+      // Enter zombified standby loop
+      setInterval(() => {}, 60000);
+    }
   }
 
   async stop() {
     this.log("daemon.shutdown.initiating", { reason: "requested" });
-    if (this.syncInterval) {
-      clearInterval(this.syncInterval);
-    }
-    if (this.syncRemoteInterval) {
-      clearInterval(this.syncRemoteInterval);
+    if (this.threadSyncInterval) {
+      clearInterval(this.threadSyncInterval);
+      this.threadSyncInterval = null;
     }
     await new Promise((resolve) => this.server?.close(resolve));
     this.appServer.stop();
@@ -478,6 +449,9 @@ export class AgentManagerDaemon {
 
       // Status UI page — served without auth so the browser can load it after tray click
       if (req.url === "/status-ui" && req.method === "GET") {
+        if (process.env.CAM_HEADLESS === "1") {
+          return json(res, 403, { ok: false, error: "Status UI is disabled in headless mode." });
+        }
         return this.#serveStatusUI(req, res);
       }
 
@@ -497,6 +471,7 @@ export class AgentManagerDaemon {
           modelProvider: body.modelProvider ?? null,
           effort: normalizeEffort(body.effort),
           serviceTier: normalizeServiceTier(body.serviceTier),
+          threadSource: body.threadSource || "codex",
           status: body.threadId ? "registered" : "unbound",
         });
         if (agent.threadId) this.threadToAgent.set(agent.threadId, agent.name);
@@ -507,26 +482,6 @@ export class AgentManagerDaemon {
         const body = await readBody(req);
         const name = body.name;
         const agent = getAgent(this.config, name);
-        if (agent && agent.node && agent.node !== this.config.nodeName) {
-          try {
-            const registry = loadRegistry(this.config);
-            const peer = registry.peers?.[agent.node];
-            if (!peer) throw new Error(`unknown remote node: ${agent.node}`);
-            const command = [
-              "node",
-              sq(`${peer.remoteRoot}/bin/cam.js`),
-              "agent",
-              "resume",
-              sq(name)
-            ].join(" ");
-            const result = await this.runSshCommand(peer, [command]);
-            if (!result.ok) throw new Error(result.stderr || `failed to resume remote agent: exit code ${result.code}`);
-            const resumedAgent = JSON.parse(result.stdout);
-            return json(res, 200, { ok: true, agent: resumedAgent });
-          } catch (err) {
-            return json(res, 500, { ok: false, error: err.message });
-          }
-        }
         const ensuredAgent = await this.#ensureThread(body.name);
         return json(res, 200, { ok: true, agent: ensuredAgent });
       }
@@ -537,25 +492,6 @@ export class AgentManagerDaemon {
         }
         const name = body.name;
         const agent = getAgent(this.config, name);
-        if (agent && agent.node && agent.node !== this.config.nodeName) {
-          try {
-            const registry = loadRegistry(this.config);
-            const peer = registry.peers?.[agent.node];
-            if (!peer) throw new Error(`unknown remote node: ${agent.node}`);
-            const args = ["node", sq(`${peer.remoteRoot}/bin/cam.js`), "agent", "set-model", sq(name)];
-            if (body.model !== undefined && body.model !== null) args.push("--model", sq(body.model));
-            if (body.modelProvider !== undefined && body.modelProvider !== null) args.push("--model-provider", sq(body.modelProvider));
-            if (body.effort !== undefined && body.effort !== null) args.push("--effort", sq(body.effort));
-            if (body.serviceTier !== undefined && body.serviceTier !== null) args.push("--service-tier", sq(body.serviceTier));
-            const command = args.join(" ");
-            const result = await this.runSshCommand(peer, [command]);
-            if (!result.ok) throw new Error(result.stderr || `failed to set model on remote agent: exit code ${result.code}`);
-            const updatedAgent = JSON.parse(result.stdout);
-            return json(res, 200, { ok: true, agent: updatedAgent });
-          } catch (err) {
-            return json(res, 500, { ok: false, error: err.message });
-          }
-        }
         if (!agent) throw new Error(`unknown agent: ${body?.name}`);
 
         const changes = {};
@@ -639,22 +575,6 @@ export class AgentManagerDaemon {
           });
         }
         const agent = getAgent(this.config, name);
-        if (agent && agent.node && agent.node !== this.config.nodeName) {
-          try {
-            const registry = loadRegistry(this.config);
-            const peer = registry.peers?.[agent.node];
-            if (!peer) throw new Error(`unknown remote node: ${agent.node}`);
-            const args = ["node", sq(`${peer.remoteRoot}/bin/cam.js`), "agent", "read", sq(name)];
-            if (!includeTurns) args.push("--latest");
-            const command = args.join(" ");
-            const result = await this.runSshCommand(peer, [command]);
-            if (!result.ok) throw new Error(result.stderr || `failed to read remote agent: exit code ${result.code}`);
-            const thread = JSON.parse(result.stdout);
-            return json(res, 200, { ok: true, agent, thread });
-          } catch (err) {
-            return json(res, 500, { ok: false, error: err.message });
-          }
-        }
         const ensuredAgent = await this.#ensureThread(name);
         let thread;
         try {
@@ -676,30 +596,6 @@ export class AgentManagerDaemon {
         const body = await readBody(req);
         const targetAgent = body.targetAgent;
         const target = getAgent(this.config, targetAgent);
-        if (target && target.node && target.node !== this.config.nodeName) {
-          try {
-            const registry = loadRegistry(this.config);
-            const peer = registry.peers?.[target.node];
-            if (!peer) throw new Error(`unknown remote node: ${target.node}`);
-            const command = [
-              "node",
-              sq(`${peer.remoteRoot}/bin/cam.js`),
-              "send",
-              sq(targetAgent),
-              sq(body.message),
-              "--from",
-              sq(body.sourceAgent || "operator"),
-              "--source-node",
-              sq(body.sourceNode || this.config.nodeName)
-            ].join(" ");
-            const result = await this.runSshCommand(peer, [command]);
-            if (!result.ok) throw new Error(result.stderr || `failed to send message via remote peer: exit code ${result.code}`);
-            const message = JSON.parse(result.stdout);
-            return json(res, 200, { ok: true, delivered: true, queued: false, message });
-          } catch (err) {
-            return json(res, 500, { ok: false, error: err.message });
-          }
-        }
         const result = await this.#sendMessage(body);
         return json(res, 200, { ok: true, ...result });
       }
@@ -792,6 +688,10 @@ export class AgentManagerDaemon {
         }
         return agent;
       }
+      if (agent.threadId && agent.activeTurnId && agent.status === "active") {
+        this.threadToAgent.set(agent.threadId, agent.name);
+        return agent;
+      }
       if (agent.threadId) {
         try {
           const resumed = await this.appServer.request("thread/resume", {
@@ -859,43 +759,51 @@ export class AgentManagerDaemon {
   }
 
   syncActiveThreads() {
-    return new Promise((resolve) => {
-      const scriptPath = path.resolve(
-        typeof __dirname !== "undefined" ? __dirname : path.dirname(fileURLToPath(import.meta.url)),
-        "query_threads.py"
-      );
+    try {
+      const codexHome = this.config.codexHome || path.join(os.homedir(), ".codex");
+      const sessionIndexPath = path.join(codexHome, "session_index.jsonl");
+      const globalStatePath = path.join(codexHome, ".codex-global-state.json");
+      const threads = [];
+      const seen = new Set();
 
-      const tryPython = (cmd) => {
-        execFile(cmd, [scriptPath], { env: process.env }, (error, stdout, stderr) => {
-          if (error) {
-            if (cmd === "python") {
-              tryPython("python3");
-            } else {
-              this.log("sync.threads.failed", { error: error.message, stderr });
-              resolve();
-            }
-            return;
-          }
+      let state = {};
+      if (fs.existsSync(globalStatePath)) {
+        state = JSON.parse(fs.readFileSync(globalStatePath, "utf8"));
+      }
+      const workspaceHints = state["thread-workspace-root-hints"] || {};
+      const workspaceRoots = [
+        ...(state["active-workspace-roots"] || []),
+        ...(state["electron-saved-workspace-roots"] || []),
+      ].filter(Boolean);
+      const defaultCwd = workspaceRoots[0] || process.cwd();
 
+      if (fs.existsSync(sessionIndexPath)) {
+        const lines = fs.readFileSync(sessionIndexPath, "utf8").split(/\r?\n/);
+        for (const line of lines) {
+          if (!line.trim()) continue;
           try {
-            const data = JSON.parse(stdout);
-            if (data.error) {
-              this.log("sync.threads.error", { error: data.error });
-              resolve();
-              return;
-            }
-
-            this.#applyThreadSync(data.threads);
-            resolve();
-          } catch (e) {
-            this.log("sync.threads.parse.failed", { error: e.message, stdout });
-            resolve();
+            const row = JSON.parse(line);
+            if (!row.id || seen.has(row.id)) continue;
+            seen.add(row.id);
+            threads.push({
+              id: row.id,
+              title: row.thread_name || `Codex ${row.id.slice(0, 8)}`,
+              agent_nickname: row.thread_name || "",
+              cwd: workspaceHints[row.id] || defaultCwd,
+              thread_source: "codex",
+            });
+          } catch (error) {
+            this.log("sync.threads.row_skipped", { error: error.message });
           }
-        });
-      };
+        }
+      }
 
-      tryPython("python");
-    });
+      this.#applyThreadSync(threads);
+      this.log("sync.threads.complete", { count: threads.length, source: "codex-json-state" });
+    } catch (error) {
+      this.log("sync.threads.failed", { error: error.message });
+    }
+    return Promise.resolve();
   }
 
   #applyThreadSync(threads) {
@@ -1020,27 +928,7 @@ export class AgentManagerDaemon {
         }
       }
 
-      const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-      const localNode = this.config.nodeName;
-      for (const agent of registry) {
-        const isLocal = !agent.node || agent.node === localNode;
-        if (isLocal && agent.threadId && uuidRegex.test(agent.threadId) && !activeThreadIds.has(agent.threadId)) {
-          try {
-            const p = paths();
-            const currentRegistry = readJson(p.registry, { agents: {} });
-            if (currentRegistry.agents && currentRegistry.agents[agent.name]) {
-              delete currentRegistry.agents[agent.name];
-              currentRegistry.updatedAt = new Date().toISOString();
-              writeJsonAtomic(p.registry, currentRegistry);
-              this.threadToAgent.delete(agent.threadId);
-              appendEvent("agent.deleted", { name: agent.name, threadId: agent.threadId });
-              this.log("sync.agent.deleted", { name: agent.name, threadId: agent.threadId });
-            }
-          } catch (e) {
-            this.log("sync.agent.delete.failed", { name: agent.name, error: e.message });
-          }
-        }
-      }
+      this.log("sync.agent.prune.skipped", { reason: "discovery is additive to avoid deleting active local agents" });
     } catch (e) {
       this.log("sync.apply.failed", { error: e.message });
     }
@@ -1083,6 +971,29 @@ export class AgentManagerDaemon {
     const targetAgent = existingMessage ? existingMessage.targetAgent : body.targetAgent;
     const targetAgentObj = getAgent(this.config, targetAgent);
 
+    if (!targetAgentObj && targetAgent === "operator") {
+      const message = existingMessage || {
+        messageId: crypto.randomUUID(),
+        correlationId: body?.correlationId || null,
+        sourceAgent: body?.sourceAgent || "operator",
+        targetAgent,
+        sourceNode: body?.sourceNode || this.config.nodeName,
+        targetNode: this.config.nodeName,
+        timestamp: new Date().toISOString(),
+        body: body?.message,
+        delivery: "queued",
+      };
+      message.delivery = "queued";
+      message.targetNode = this.config.nodeName;
+      delete message.error;
+      if (!existingMessage) {
+        this.queueMessage(message);
+        appendEvent("message.queued", message);
+      }
+      this.log("operator.inbox.queued", { messageId: message.messageId, sourceAgent: message.sourceAgent });
+      return { delivered: false, queued: true, message };
+    }
+
     if (targetAgentObj && targetAgentObj.threadSource === "antigravity") {
       const message = existingMessage || {
         messageId: crypto.randomUUID(),
@@ -1093,57 +1004,16 @@ export class AgentManagerDaemon {
         targetNode: targetAgentObj.node,
         timestamp: new Date().toISOString(),
         body: body.message,
-        delivery: "delivered",
+        delivery: "queued",
       };
       if (existingMessage) {
-        message.delivery = "delivered";
+        message.delivery = "queued";
       }
-      setAgent(this.config, targetAgent, { status: "active", lastDelivery: message });
-      appendEvent("message.delivered", message);
-      this.log("message.delivered.external", { messageId: message.messageId, target: targetAgent });
-      
-      if (existingMessage) {
-        markMailboxSurfaced([message.messageId], null);
-      }
-
-      // Native Antigravity Integration: Actively forward the message to the language server
-      // and wait for a response to route back.
-      this.log("antigravity.native.routing", { messageId: message.messageId, targetAgent });
-      
-      (async () => {
-        try {
-          const conversationId = targetAgentObj.threadId;
-          const logDir = path.join(os.homedir(), ".gemini", "antigravity", "brain", conversationId, ".system_generated", "logs");
-          const logFile = path.join(logDir, "transcript.jsonl");
-          let startByte = 0;
-          if (fs.existsSync(logFile)) {
-            startByte = fs.statSync(logFile).size;
-          }
-
-          // Send message to language server
-          await runAgyCommand(["send-message", conversationId, message.body], (t, p) => this.log(t, p));
-          
-          // Wait for reply via transcript
-          const replyText = await pollAgyTranscript(conversationId, startByte, (t, p) => this.log(t, p));
-          
-          // Route response back natively via internal loop
-          this.log("antigravity.native.response_received", { conversationId, replyText });
-          await this.#sendMessage({
-            targetAgent: message.sourceAgent,
-            message: replyText,
-            sourceAgent: targetAgent,
-            sourceNode: this.config.nodeName,
-          });
-          
-        } catch (nativeErr) {
-          this.log("antigravity.native.error", { messageId: message.messageId, targetAgent, error: nativeErr.message });
-        } finally {
-          setAgent(this.config, targetAgent, { status: "idle" });
-          this.#checkInboxListeners();
-        }
-      })();
-
-      return { delivered: true, queued: false, message };
+      this.queueMessage(message);
+      setAgent(this.config, targetAgent, { status: "idle", lastDelivery: message });
+      appendEvent("message.queued", message);
+      this.log("antigravity.inbox.queued", { messageId: message.messageId, target: targetAgent });
+      return { delivered: false, queued: true, message };
     }
 
     const source = body ? getAgent(this.config, body.sourceAgent) : null;
@@ -1226,6 +1096,8 @@ export class AgentManagerDaemon {
       "",
       message.body,
       pendingText,
+      "",
+      `[To reply to this message, use the qexow-cam-messaging skill or send via CAM HTTP to targetAgent "${message.sourceAgent}". Do not use older codex-agent-manager paths.]`
     ].join("\n");
 
     try {
@@ -1319,253 +1191,32 @@ export class AgentManagerDaemon {
     }
   }
 
-  runSshCommand(peer, commandArgs, stdinContent = null, timeoutMs = 45000) {
-    return new Promise((resolve) => {
-      const sshArgs = ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5"];
-      if (peer.key) sshArgs.push("-i", peer.key);
-      sshArgs.push(peer.ssh, ...commandArgs);
-
-      const child = execFile("ssh", sshArgs, { timeout: timeoutMs }, (error, stdout, stderr) => {
-        if (error) {
-          resolve({ ok: false, code: error.code || -1, stdout, stderr: stderr || error.message });
-        } else {
-          resolve({ ok: true, code: 0, stdout, stderr });
-        }
-      });
-
-      if (stdinContent && child.stdin) {
-        child.stdin.write(stdinContent);
-        child.stdin.end();
-      }
-    });
+  async resolveRemoteRoot() {
+    return null;
   }
 
-  async syncRemotePeers() {
-    this.log("sync.remote.start");
-    try {
-      const registry = loadRegistry(this.config);
-      const peers = Object.values(registry.peers || {});
-      if (!peers.length) {
-        return;
-      }
-      for (const peer of peers) {
-        try {
-          await this.syncPeer(peer);
-        } catch (e) {
-          this.log("sync.remote.peer.failed", { peer: peer.name, error: e.message });
-        }
-      }
-    } catch (e) {
-      this.log("sync.remote.failed", { error: e.message });
-    }
-  }
-
-  async syncPeer(peer) {
-    const peerName = peer.name;
-    this.log("sync.peer.start", { peer: peerName });
-
-    let remoteAgents = [];
-    let successStrategy = null;
-
-    // Stage 1: CLI list
-    if (!successStrategy) {
-      const command = `node ${sq(`${peer.remoteRoot}/bin/cam.js`)} agent list`;
-      const result = await this.runSshCommand(peer, [command]);
-      if (result.ok) {
-        try {
-          const lines = result.stdout.split(/\r?\n/).filter(Boolean);
-          const agents = [];
-          for (const line of lines) {
-            const fields = line.split("\t");
-            if (fields.length >= 3) {
-              agents.push({
-                name: fields[0],
-                status: fields[1],
-                node: fields[2],
-                threadId: fields[3] === "-" ? null : fields[3],
-                model: fields[4] === "-" ? null : fields[4],
-                modelProvider: fields[5] === "-" ? null : fields[5],
-                effort: fields[6] === "-" ? null : fields[6],
-                serviceTier: fields[7] === "standard" ? null : fields[7],
-                cwd: fields[8] || ""
-              });
-            }
-          }
-          if (agents.length > 0) {
-            remoteAgents = agents;
-            successStrategy = "cli";
-            this.log("sync.peer.success", { peer: peerName, strategy: "cli", count: agents.length });
-          }
-        } catch (e) {
-          this.log("sync.peer.strategy.cli.parse.error", { peer: peerName, error: e.message });
-        }
-      }
-    }
-
-    // Stage 2: Registry JSON file
-    if (!successStrategy) {
-      const command = `cat ~/.qexow-cam/agents.json`;
-      const result = await this.runSshCommand(peer, [command]);
-      if (result.ok) {
-        try {
-          const registry = JSON.parse(result.stdout);
-          const agents = [];
-          if (registry && registry.agents) {
-            for (const key of Object.keys(registry.agents)) {
-              const a = registry.agents[key];
-              agents.push({
-                name: a.name,
-                status: a.status || "idle",
-                node: peerName,
-                threadId: a.threadId || null,
-                model: a.model || null,
-                modelProvider: a.modelProvider || null,
-                effort: a.effort || null,
-                serviceTier: a.serviceTier || null,
-                cwd: a.cwd || ""
-              });
-            }
-          }
-          remoteAgents = agents;
-          successStrategy = "registry";
-          this.log("sync.peer.success", { peer: peerName, strategy: "registry", count: agents.length });
-        } catch (e) {
-          this.log("sync.peer.strategy.registry.parse.error", { peer: peerName, error: e.message });
-        }
-      }
-    }
-
-    // Stage 3: Python direct query
-    if (!successStrategy) {
-      const result = await this.runSshCommand(peer, ["python3"], this.pyRemoteScript);
-      if (result.ok) {
-        try {
-          const data = JSON.parse(result.stdout);
-          if (data.threads) {
-            remoteAgents = data.threads.map(t => ({
-              name: t.title,
-              status: "idle",
-              node: peerName,
-              threadId: t.id,
-              cwd: t.cwd || ""
-            }));
-            successStrategy = "python";
-            this.log("sync.peer.success", { peer: peerName, strategy: "python", count: remoteAgents.length });
-          }
-        } catch (e) {
-          this.log("sync.peer.strategy.python.parse.error", { peer: peerName, error: e.message });
-        }
-      }
-    }
-
-    // Stage 4: Node.js direct query
-    if (!successStrategy) {
-      const result = await this.runSshCommand(peer, ["node -e " + sq("eval(require('fs').readFileSync(0, 'utf-8'))")], this.jsRemoteScript);
-      if (result.ok) {
-        try {
-          const data = JSON.parse(result.stdout);
-          if (data.threads) {
-            remoteAgents = data.threads.map(t => ({
-              name: t.title,
-              status: "idle",
-              node: peerName,
-              threadId: t.id,
-              cwd: t.cwd || ""
-            }));
-            successStrategy = "node";
-            this.log("sync.peer.success", { peer: peerName, strategy: "node", count: remoteAgents.length });
-          }
-        } catch (e) {
-          this.log("sync.peer.strategy.node.parse.error", { peer: peerName, error: e.message });
-        }
-      }
-    }
-
-    if (!successStrategy) {
-      this.log("sync.peer.failed.all-strategies", { peer: peerName });
-      return;
-    }
-
-    // Process and upsert remote agents
-    const currentRegistry = loadRegistry(this.config);
-    const peerAgentNames = [];
-    const activeRemoteThreadIds = new Set();
-
-    const normalizeName = (text) => {
-      if (!text) return "";
-      return text
-        .toLowerCase()
-        .replace(/[^a-z0-9\s-]/g, "")
-        .trim()
-        .replace(/[\s_]+/g, "-")
-        .replace(/-+/g, "-")
-        .replace(/^-+|-+$/g, "");
-    };
-
-    for (const agent of remoteAgents) {
-      if (agent.threadId) {
-        activeRemoteThreadIds.add(agent.threadId);
-      }
-
-      // Check name conflict
-      let baseName = normalizeName(agent.name);
-      if (!baseName) {
-        baseName = agent.threadId ? `agent-${agent.threadId.substring(0, 8)}` : "remote-agent";
-      }
-
-      let uniqueName = baseName;
-      let existingAgent = currentRegistry.agents[uniqueName];
-
-      // If name already exists but belongs to a different node, resolve conflict
-      if (existingAgent && existingAgent.node !== peerName) {
-        uniqueName = `${baseName}-${peerName}`;
-        existingAgent = currentRegistry.agents[uniqueName];
-      }
-
-      let counter = 1;
-      while (existingAgent && existingAgent.node !== peerName) {
-        counter++;
-        uniqueName = `${baseName}-${peerName}-${counter}`;
-        existingAgent = currentRegistry.agents[uniqueName];
-      }
-
-      // If we are renaming the agent locally, cleanup old name
-      if (existingAgent && existingAgent.threadId === agent.threadId && existingAgent.name !== uniqueName) {
-        delete currentRegistry.agents[existingAgent.name];
-      }
-
-      agent.name = uniqueName;
-      upsertAgent(this.config, agent);
-      peerAgentNames.push(uniqueName);
-    }
-
-    // Update peer registry listing
-    const freshRegistry = loadRegistry(this.config);
-    if (freshRegistry.peers && freshRegistry.peers[peerName]) {
-      freshRegistry.peers[peerName].agents = peerAgentNames;
-      freshRegistry.peers[peerName].lastCheckedAt = new Date().toISOString();
-      saveRegistry(freshRegistry);
-    }
-
-    // Clean up stale agents for this remote node
-    const finalRegistry = loadRegistry(this.config);
-    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    for (const key of Object.keys(finalRegistry.agents)) {
-      const a = finalRegistry.agents[key];
-      if (a.node === peerName && a.threadId && uuidRegex.test(a.threadId) && !activeRemoteThreadIds.has(a.threadId)) {
-        delete finalRegistry.agents[key];
-        saveRegistry(finalRegistry);
-        this.threadToAgent.delete(a.threadId);
-        this.log("sync.remote.agent.deleted", { name: a.name, threadId: a.threadId, peer: peerName });
-      }
-    }
+  async syncPeer() {
+    return;
   }
 }
 
 
 export async function runDaemon() {
-  const daemon = new AgentManagerDaemon();
-  await daemon.start();
-  process.on("SIGINT", () => daemon.stop().then(() => process.exit(0)));
-  process.on("SIGTERM", () => daemon.stop().then(() => process.exit(0)));
+  try {
+    const daemon = new AgentManagerDaemon();
+    await daemon.start();
+    process.on("SIGINT", () => daemon.stop().then(() => process.exit(0)));
+    process.on("SIGTERM", () => daemon.stop().then(() => process.exit(0)));
+  } catch (err) {
+    try {
+      const logFile = path.join(os.homedir(), ".qexow-cam", "logs", "daemon.log");
+      const entry = {
+        timestamp: new Date().toISOString(),
+        type: "daemon.startup.fatal_error",
+        payload: { error: err.message, stack: err.stack },
+      };
+      fs.appendFileSync(logFile, JSON.stringify(entry) + "\n", "utf8");
+    } catch (_) {}
+    process.exit(1);
+  }
 }

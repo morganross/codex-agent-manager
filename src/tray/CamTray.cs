@@ -39,8 +39,6 @@ namespace CamTray
                 ExtractResource("cam-core.exe", Path.Combine(binDir, "cam-core.exe"));
                 ExtractResource("daemon-entry.js", Path.Combine(binDir, "daemon-entry.js"));
                 ExtractResource("query_threads.py", Path.Combine(binDir, "query_threads.py"));
-                ExtractResource("remote_query_threads.py", Path.Combine(binDir, "remote_query_threads.py"));
-                ExtractResource("remote_query_threads.js", Path.Combine(binDir, "remote_query_threads.js"));
             }
             catch (Exception ex)
             {

@@ -1,5 +1,6 @@
 import os from "node:os";
 import fs from "node:fs";
+import path from "node:path";
 import { appendJsonl, paths, readJson, readJsonl, writeJsonAtomic } from "./paths.js";
 
 export function loadRegistry(config) {
@@ -13,6 +14,45 @@ export function loadRegistry(config) {
   });
   registry.agents ||= {};
   registry.peers ||= {};
+
+  try {
+    const codexHome = config?.codexHome || process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+    const globalStatePath = path.join(codexHome, ".codex-global-state.json");
+    let changed = false;
+    if (fs.existsSync(globalStatePath)) {
+      const state = JSON.parse(fs.readFileSync(globalStatePath, "utf8"));
+      const connections = state?.["codex-managed-remote-connections"] || [];
+      for (const conn of connections) {
+        const alias = conn.alias || conn.displayName;
+        if (!alias) continue;
+        const existing = registry.peers[alias] || {};
+        const normalized = {
+          ...existing,
+          name: alias,
+          transport: "codex-managed",
+          ssh: alias,
+          key: null,
+          remoteRoot: "auto",
+          agents: existing.agents || [],
+          enrolledAt: existing.enrolledAt || new Date().toISOString(),
+          discovered: true,
+          codexHostId: conn.hostId || existing.codexHostId || null,
+          codexDisplayName: conn.displayName || existing.codexDisplayName || alias,
+        };
+        if (JSON.stringify(existing) !== JSON.stringify(normalized)) {
+          registry.peers[alias] = normalized;
+          changed = true;
+        }
+      }
+    }
+    if (changed) {
+      registry.updatedAt = new Date().toISOString();
+      writeJsonAtomic(p.registry, registry);
+    }
+  } catch (error) {
+    // Fail silently on read error to prevent crashing CLI/daemon
+  }
+
   return registry;
 }
 
