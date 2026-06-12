@@ -12,6 +12,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import net from "node:net";
+import { execFile } from "node:child_process";
 import { AppServerClient, textInput } from "./app-server.js";
 import { ensureLocalToken, loadConfig } from "./config.js";
 import {
@@ -759,51 +760,56 @@ export class AgentManagerDaemon {
   }
 
   syncActiveThreads() {
-    try {
-      const codexHome = this.config.codexHome || path.join(os.homedir(), ".codex");
-      const sessionIndexPath = path.join(codexHome, "session_index.jsonl");
-      const globalStatePath = path.join(codexHome, ".codex-global-state.json");
-      const threads = [];
-      const seen = new Set();
-
-      let state = {};
-      if (fs.existsSync(globalStatePath)) {
-        state = JSON.parse(fs.readFileSync(globalStatePath, "utf8"));
+    return new Promise((resolve) => {
+      const scriptPath = this.#queryThreadsScriptPath();
+      if (!scriptPath) {
+        this.log("sync.threads.failed", { error: "query_threads.py not found; refusing session_index fallback" });
+        resolve();
+        return;
       }
-      const workspaceHints = state["thread-workspace-root-hints"] || {};
-      const workspaceRoots = [
-        ...(state["active-workspace-roots"] || []),
-        ...(state["electron-saved-workspace-roots"] || []),
-      ].filter(Boolean);
-      const defaultCwd = workspaceRoots[0] || process.cwd();
 
-      if (fs.existsSync(sessionIndexPath)) {
-        const lines = fs.readFileSync(sessionIndexPath, "utf8").split(/\r?\n/);
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const row = JSON.parse(line);
-            if (!row.id || seen.has(row.id)) continue;
-            seen.add(row.id);
-            threads.push({
-              id: row.id,
-              title: row.thread_name || `Codex ${row.id.slice(0, 8)}`,
-              agent_nickname: row.thread_name || "",
-              cwd: workspaceHints[row.id] || defaultCwd,
-              thread_source: "codex",
-            });
-          } catch (error) {
-            this.log("sync.threads.row_skipped", { error: error.message });
+      const tryPython = (cmd) => {
+        execFile(cmd, [scriptPath], { env: process.env }, (error, stdout, stderr) => {
+          if (error) {
+            if (cmd === "python") {
+              tryPython("python3");
+              return;
+            }
+            this.log("sync.threads.failed", { error: error.message, stderr, source: "query_threads.py" });
+            resolve();
+            return;
           }
-        }
-      }
 
-      this.#applyThreadSync(threads);
-      this.log("sync.threads.complete", { count: threads.length, source: "codex-json-state" });
-    } catch (error) {
-      this.log("sync.threads.failed", { error: error.message });
-    }
-    return Promise.resolve();
+          try {
+            const data = JSON.parse(stdout);
+            if (data.error) {
+              this.log("sync.threads.failed", { error: data.error, source: "query_threads.py" });
+              resolve();
+              return;
+            }
+            const threads = Array.isArray(data.threads) ? data.threads : [];
+            this.#applyThreadSync(threads);
+            this.log("sync.threads.complete", { count: threads.length, source: "query_threads.py", scriptPath });
+          } catch (e) {
+            this.log("sync.threads.parse.failed", { error: e.message, stdout, source: "query_threads.py" });
+          }
+          resolve();
+        });
+      };
+
+      tryPython("python");
+    });
+  }
+
+  #queryThreadsScriptPath() {
+    const candidates = [
+      path.join(process.cwd(), "src", "query_threads.py"),
+      path.join(process.cwd(), "query_threads.py"),
+      path.join(path.dirname(process.execPath), "query_threads.py"),
+      path.join(path.dirname(process.execPath), "src", "query_threads.py"),
+      path.join(os.homedir(), "OneDrive", "Documents", "New project", "codex-agent-manager", "src", "query_threads.py"),
+    ];
+    return candidates.find((candidate) => fs.existsSync(candidate)) || null;
   }
 
   #applyThreadSync(threads) {

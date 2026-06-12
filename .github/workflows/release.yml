@@ -42,8 +42,8 @@ jobs:
         Invoke-WebRequest -Uri "https://nodejs.org/dist/v22.22.3/node-v22.22.3-linux-arm64.tar.gz" -OutFile $arm64Zip -ErrorAction Stop
         tar -xf $arm64Zip -C $binDir "node-v22.22.3-linux-arm64/bin/node"
 
-    - name: Compile Windows & Linux Binaries
-      run: npm run build
+    - name: Build installer payload
+      run: npm run build:installer-payload
 
     - name: Install Inno Setup
       run: choco install innosetup --yes --no-progress
@@ -57,13 +57,11 @@ jobs:
         }
         & $iscc installer.iss
 
+    - name: Delete standalone executable payloads
+      run: npm run purge-standalone-exes
+
     - name: Publish to GitHub Releases
       uses: softprops/action-gh-release@v2
       with:
         files: |
           dist/QexowCamSetup.exe
-          dist/cam.exe
-          dist/qexow-cam-gui.exe
-          dist/cam-linux-x64
-          dist/cam-linux-arm64
-          dist/cam-bundle.cjs

@@ -1,6 +1,6 @@
 [Setup]
 AppName=Qexow CAM
-AppVersion=2.1.8
+AppVersion=2.1.9
 DefaultDirName={autopf}\Qexow CAM
 DefaultGroupName=Qexow CAM
 OutputDir=dist
@@ -27,10 +27,11 @@ Name: "tray"; Description: "System Tray GUI & Shortcuts"; Types: full custom
 ; The ONE executable — cam.exe is a Node.js SEA containing all logic
 Source: "dist\cam.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: daemon
 Source: "dist\qexow-cam-gui.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: tray
+Source: "src\query_threads.py"; DestDir: "{app}"; Flags: ignoreversion; Components: tray
 
 [Icons]
-; Start Menu: opens status window (signals running instance, or launches fresh)
-Name: "{group}\Qexow CAM"; Filename: "{app}\cam.exe"; Parameters: "tray"; Components: tray
+; Start Menu: opens the single user-facing Windows GUI.
+Name: "{group}\Qexow CAM"; Filename: "{app}\qexow-cam-gui.exe"; Components: tray
 Name: "{group}\Uninstall Qexow CAM"; Filename: "{uninstallexe}"
 
 [Registry]
@@ -38,8 +39,8 @@ Name: "{group}\Uninstall Qexow CAM"; Filename: "{uninstallexe}"
 Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Check: NeedsAddPath(ExpandConstant('{app}')) and IsAdminInstallMode
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Check: NeedsAddPath(ExpandConstant('{app}')) and not IsAdminInstallMode
 ; Launch tray on Windows startup (user-level)
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Qexow CAM"; ValueData: """{app}\cam.exe"" tray"; Components: tray
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Qexow CAM GUI"; ValueData: """{app}\qexow-cam-gui.exe"""; Components: tray
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Qexow CAM"; ValueData: """{app}\qexow-cam-gui.exe"""; Components: tray
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Qexow CAM GUI"; Flags: deletevalue
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Qexow CAM Tray Proof"; Flags: deletevalue
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Codex Agent Manager"; Flags: deletevalue
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Codex Agent Manager Tray"; Flags: deletevalue
@@ -90,7 +91,6 @@ Type: files; Name: "{userstartup}\Codex Agent Manager.cmd"
 ; Record local startup metadata. This does not create scheduled tasks or shell scripts.
 Filename: "{app}\cam.exe"; Parameters: "install-service"; StatusMsg: "Configuring startup service..."; Components: daemon; Flags: runhidden; Check: not IsHeadlessInstall
 ; After install: start tray (which auto-starts the daemon) — no cmd windows
-Filename: "{app}\cam.exe"; Parameters: "tray"; Description: "Launch Qexow CAM System Tray"; Flags: postinstall nowait; Components: tray; Check: not IsHeadlessInstall
 Filename: "{app}\qexow-cam-gui.exe"; Description: "Launch Qexow CAM GUI"; Flags: nowait; Components: tray; Check: not IsHeadlessInstall
 
 [Code]
@@ -106,6 +106,15 @@ var
   ResultCode: Integer;
 begin
   Exec('schtasks.exe', '/Delete /TN "' + TaskName + '" /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure KillLegacyNodeDaemon();
+var
+  ResultCode: Integer;
+begin
+  Exec('powershell.exe',
+    '-NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq ''node.exe'' -and $_.CommandLine -like ''*Qexow CAM*daemon-entry.js*'' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
 procedure DeleteIfExists(PathName: string);
@@ -137,6 +146,7 @@ begin
   KillProcess('cam-core.exe');
   KillProcess('cam-tray.exe');
   KillProcess('tray_windows_release.exe');
+  KillLegacyNodeDaemon();
 
   // Remove old task/startup launch points so only the current tray command starts.
   DeleteScheduledTask('CodexAgentManager');

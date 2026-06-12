@@ -1,6 +1,6 @@
 {
   "name": "qexow-cam",
-  "version": "2.1.8",
+  "version": "2.1.9",
   "private": true,
   "description": "Qexow CAM — local agent registry and message bus.",
   "type": "module",
@@ -11,7 +11,10 @@
     "doctor": "node ./bin/cam.js doctor",
     "daemon": "node ./bin/cam.js daemon start",
     "test:smoke": "node ./scripts/smoke-local.js",
-    "build": "node scripts/build.mjs"
+    "build": "node scripts/refuse-local-build.mjs",
+    "build:installer-payload": "node scripts/build-installer-payload.mjs",
+    "purge-standalone-exes": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/purge-standalone-exes.ps1",
+    "watch-workspace-exes": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/watch-workspace-exes.ps1"
   },
   "engines": {
     "node": ">=18"

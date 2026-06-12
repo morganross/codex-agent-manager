@@ -35,6 +35,7 @@ namespace QexowCamGui
             Directory.CreateDirectory(Path.Combine(root, "logs"));
             logFile = Path.Combine(root, "logs", "windows-gui.log");
             Log("gui-start pid=" + Process.GetCurrentProcess().Id + " exe=\"" + Application.ExecutablePath + "\"");
+            StopOtherGuiInstances();
 
             trayIcon = new NotifyIcon();
             trayIcon.Icon = SystemIcons.Application;
@@ -91,6 +92,25 @@ namespace QexowCamGui
             {
             }
         }
+
+        private void StopOtherGuiInstances()
+        {
+            int currentPid = Process.GetCurrentProcess().Id;
+            foreach (Process process in Process.GetProcessesByName("qexow-cam-gui"))
+            {
+                try
+                {
+                    if (process.Id == currentPid) continue;
+                    Log("gui-duplicate-stop pid=" + process.Id);
+                    process.Kill();
+                    process.WaitForExit(3000);
+                }
+                catch (Exception ex)
+                {
+                    Log("gui-duplicate-stop-failed pid=" + process.Id + " error=" + ex.Message);
+                }
+            }
+        }
     }
 
     sealed class MainForm : Form
@@ -104,6 +124,8 @@ namespace QexowCamGui
         private readonly Button testButton;
         private readonly CheckBox showArchivedCheckBox;
         private readonly JavaScriptSerializer json = new JavaScriptSerializer();
+        private Dictionary<string, Dictionary<string, object>> activeThreadMetadata = new Dictionary<string, Dictionary<string, object>>(StringComparer.OrdinalIgnoreCase);
+        private bool daemonStartAttempted = false;
 
         public MainForm(Action<string> logger)
         {
@@ -217,6 +239,27 @@ namespace QexowCamGui
                 }
                 catch (Exception ex)
                 {
+                    if (!daemonStartAttempted && TryStartDaemon())
+                    {
+                        Thread.Sleep(2000);
+                        try
+                        {
+                            Dictionary<string, object> retryHealth = ApiGet("/health");
+                            object retryNodeName = retryHealth.ContainsKey("nodeName") ? retryHealth["nodeName"] : "";
+                            object retryStartedAt = retryHealth.ContainsKey("startedAt") ? retryHealth["startedAt"] : "";
+                            InvokeUi(delegate
+                            {
+                                daemonLight.BackColor = Color.LimeGreen;
+                                daemonLabel.Text = "Daemon online - node=" + retryNodeName + " started=" + retryStartedAt;
+                            });
+                            log("health-ok-after-daemon-start");
+                            goto LoadAgentList;
+                        }
+                        catch (Exception retryEx)
+                        {
+                            ex = retryEx;
+                        }
+                    }
                     InvokeUi(delegate
                     {
                         daemonLight.BackColor = Color.OrangeRed;
@@ -225,6 +268,7 @@ namespace QexowCamGui
                     log("health-error " + ex.Message);
                 }
 
+            LoadAgentList:
                 try
                 {
                     List<Dictionary<string, object>> agents = LoadAgents();
@@ -243,17 +287,22 @@ namespace QexowCamGui
         {
             agentsGrid.Columns.Clear();
             agentsGrid.Rows.Clear();
-            foreach (string column in new[] { "light", "name", "status", "node", "threadId", "activeTurnId", "cwd", "model" })
+            foreach (string column in new[] { "light", "chatTitle", "name", "status", "node", "threadId", "activeTurnId", "cwd", "model" })
             {
                 agentsGrid.Columns.Add(column, column);
             }
             agentsGrid.Columns["light"].HeaderText = "";
+            agentsGrid.Columns["chatTitle"].HeaderText = "chat";
+            agentsGrid.Columns["name"].HeaderText = "agent mapping";
             agentsGrid.Columns["light"].Width = 34;
             agentsGrid.Columns["light"].FillWeight = 8;
+            agentsGrid.Columns["chatTitle"].FillWeight = 28;
+            agentsGrid.Columns["name"].FillWeight = 22;
             foreach (Dictionary<string, object> agent in agents)
             {
                 int rowIndex = agentsGrid.Rows.Add(
                     "●",
+                    DisplayTitle(agent),
                     Value(agent, "name"),
                     Value(agent, "status"),
                     Value(agent, "node"),
@@ -384,6 +433,12 @@ namespace QexowCamGui
                 string threadId = Value(agent, "threadId");
                 if (!String.IsNullOrWhiteSpace(threadId) && activeThreadIds.Contains(threadId))
                 {
+                    if (activeThreadMetadata.ContainsKey(threadId))
+                    {
+                        Dictionary<string, object> thread = activeThreadMetadata[threadId];
+                        agent["chatTitle"] = Value(thread, "title");
+                        agent["threadSource"] = Value(thread, "thread_source");
+                    }
                     filtered.Add(agent);
                 }
             }
@@ -393,9 +448,95 @@ namespace QexowCamGui
 
         private HashSet<string> LoadActiveThreadIds()
         {
-            HashSet<string> ids = LoadActiveThreadIdsFromSqlite();
+            HashSet<string> ids = LoadActiveThreadIdsFromClassifier();
             if (ids.Count > 0) return ids;
-            return LoadActiveThreadIdsFromSessionFiles();
+            log("active-filter failed reason=robust-classifier-unavailable");
+            return ids;
+        }
+
+        private HashSet<string> LoadActiveThreadIdsFromClassifier()
+        {
+            HashSet<string> ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, Dictionary<string, object>> metadata = new Dictionary<string, Dictionary<string, object>>(StringComparer.OrdinalIgnoreCase);
+            string script = FindQueryThreadsScript();
+            if (String.IsNullOrWhiteSpace(script))
+            {
+                log("active-classifier-skipped reason=query_threads.py-not-found");
+                return ids;
+            }
+
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = "python";
+                psi.Arguments = "\"" + script.Replace("\"", "\\\"") + "\"";
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                using (Process process = Process.Start(psi))
+                {
+                    string output = process.StandardOutput.ReadToEnd();
+                    string error = process.StandardError.ReadToEnd();
+                    process.WaitForExit(10000);
+                    if (!process.HasExited)
+                    {
+                        try { process.Kill(); } catch {}
+                        log("active-classifier-error timeout");
+                        return ids;
+                    }
+                    if (process.ExitCode != 0)
+                    {
+                        log("active-classifier-error " + error.Trim());
+                        return ids;
+                    }
+
+                    Dictionary<string, object> result = json.Deserialize<Dictionary<string, object>>(output);
+                    if (result != null && result.ContainsKey("threads") && result["threads"] is ArrayList)
+                    {
+                        ArrayList threads = (ArrayList)result["threads"];
+                        foreach (object row in threads)
+                        {
+                            Dictionary<string, object> thread = row as Dictionary<string, object>;
+                            if (thread == null) continue;
+                            string id = Value(thread, "id");
+                            if (!String.IsNullOrWhiteSpace(id))
+                            {
+                                ids.Add(id);
+                                metadata[id] = thread;
+                            }
+                        }
+                        activeThreadMetadata = metadata;
+                        log("active-classifier-loaded count=" + ids.Count + " script=\"" + script + "\"");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                log("active-classifier-exception " + ex.Message);
+            }
+            return ids;
+        }
+
+        private string FindQueryThreadsScript()
+        {
+            string exeDir = AppDomain.CurrentDomain.BaseDirectory;
+            string[] candidates = new string[]
+            {
+                Path.Combine(exeDir, "query_threads.py"),
+                Path.Combine(exeDir, "src", "query_threads.py"),
+                Path.Combine(Environment.CurrentDirectory, "src", "query_threads.py"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "OneDrive", "Documents", "New project", "codex-agent-manager", "src", "query_threads.py")
+            };
+            foreach (string candidate in candidates)
+            {
+                try
+                {
+                    if (File.Exists(candidate)) return candidate;
+                }
+                catch {}
+            }
+            return null;
         }
 
         private HashSet<string> LoadActiveThreadIdsFromSqlite()
@@ -507,6 +648,51 @@ namespace QexowCamGui
         {
             if (map == null || !map.ContainsKey(key) || map[key] == null) return "";
             return Convert.ToString(map[key]);
+        }
+
+        private static string DisplayTitle(Dictionary<string, object> agent)
+        {
+            string title = Value(agent, "chatTitle");
+            if (!String.IsNullOrWhiteSpace(title)) return title;
+            string name = Value(agent, "name");
+            if (!String.IsNullOrWhiteSpace(name)) return name;
+            return Value(agent, "threadId");
+        }
+
+        private bool TryStartDaemon()
+        {
+            daemonStartAttempted = true;
+            try
+            {
+                string exeDir = AppDomain.CurrentDomain.BaseDirectory;
+                string camExe = Path.Combine(exeDir, "cam.exe");
+                if (!File.Exists(camExe))
+                {
+                    string repoCamExe = Path.Combine(Environment.CurrentDirectory, "dist", "cam.exe");
+                    if (File.Exists(repoCamExe)) camExe = repoCamExe;
+                }
+                if (!File.Exists(camExe))
+                {
+                    log("daemon-start-skipped reason=cam.exe-not-found");
+                    return false;
+                }
+
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = camExe;
+                psi.Arguments = "daemon start";
+                psi.WorkingDirectory = Path.GetDirectoryName(camExe);
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.WindowStyle = ProcessWindowStyle.Hidden;
+                Process process = Process.Start(psi);
+                log("daemon-started-from-gui pid=" + (process == null ? "unknown" : Convert.ToString(process.Id)) + " exe=\"" + camExe + "\"");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                log("daemon-start-error " + ex.Message);
+                return false;
+            }
         }
 
         private static string AppendLine(string existing, string line)
