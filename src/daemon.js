@@ -977,7 +977,7 @@ export class AgentManagerDaemon {
     const targetAgent = existingMessage ? existingMessage.targetAgent : body.targetAgent;
     const targetAgentObj = getAgent(this.config, targetAgent);
 
-    if (!targetAgentObj && targetAgent === "operator") {
+    if (!targetAgentObj && (targetAgent === "operator" || targetAgent === "windows-gui")) {
       const message = existingMessage || {
         messageId: crypto.randomUUID(),
         correlationId: body?.correlationId || null,
@@ -996,7 +996,7 @@ export class AgentManagerDaemon {
         this.queueMessage(message);
         appendEvent("message.queued", message);
       }
-      this.log("operator.inbox.queued", { messageId: message.messageId, sourceAgent: message.sourceAgent });
+      this.log("mailbox_only_target.inbox.queued", { targetAgent, messageId: message.messageId, sourceAgent: message.sourceAgent });
       return { delivered: false, queued: true, message };
     }
 
