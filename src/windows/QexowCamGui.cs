@@ -12,9 +12,9 @@ using System.Windows.Forms;
 using System.Reflection;
 using System.Net.Sockets;
 
-[assembly: AssemblyVersion("2.1.38.0")]
-[assembly: AssemblyFileVersion("2.1.38.0")]
-[assembly: AssemblyInformationalVersion("2.1.38")]
+[assembly: AssemblyVersion("2.1.39.0")]
+[assembly: AssemblyFileVersion("2.1.39.0")]
+[assembly: AssemblyInformationalVersion("2.1.39")]
 
 namespace QexowCamGui
 {
@@ -449,7 +449,7 @@ namespace QexowCamGui
                 string state = Value(peer, "state").ToLowerInvariant();
                 if (state == "mirrored") color = Color.LimeGreen;
                 else if (state == "verified" || state == "probe-ready") color = Color.DodgerBlue;
-                else if (state == "missing-key" || state == "missing-ip" || state == "missing-username" || state == "sync-failed") color = Color.OrangeRed;
+                else if (state == "missing-key" || state == "missing-ip" || state == "missing-username" || state == "sync-failed" || state == "probe-failed") color = Color.OrangeRed;
                 row.DefaultCellStyle.ForeColor = color;
             }
         }
@@ -473,16 +473,22 @@ namespace QexowCamGui
             int mirrored = 0;
             int missingKey = 0;
             int missingIp = 0;
+            int missingUsername = 0;
             int probeReady = 0;
+            int probeFailed = 0;
+            int syncFailed = 0;
             foreach (Dictionary<string, object> peer in peers)
             {
                 string state = Value(peer, "state");
                 if (String.Equals(state, "mirrored", StringComparison.OrdinalIgnoreCase)) mirrored++;
                 if (String.Equals(state, "missing-key", StringComparison.OrdinalIgnoreCase)) missingKey++;
                 if (String.Equals(state, "missing-ip", StringComparison.OrdinalIgnoreCase)) missingIp++;
+                if (String.Equals(state, "missing-username", StringComparison.OrdinalIgnoreCase)) missingUsername++;
                 if (String.Equals(state, "probe-ready", StringComparison.OrdinalIgnoreCase)) probeReady++;
+                if (String.Equals(state, "probe-failed", StringComparison.OrdinalIgnoreCase)) probeFailed++;
+                if (String.Equals(state, "sync-failed", StringComparison.OrdinalIgnoreCase)) syncFailed++;
             }
-            discoveryLabel.Text = "Remote discovery: " + peers.Count + " peers, " + mirrored + " mirrored, " + probeReady + " ready to probe, " + missingKey + " missing key, " + missingIp + " missing IP.";
+            discoveryLabel.Text = "Remote discovery: " + peers.Count + " peers, " + mirrored + " mirrored, " + probeReady + " ready, " + probeFailed + " probe failed, " + syncFailed + " sync failed, " + missingKey + " missing key, " + missingIp + " missing IP, " + missingUsername + " missing user.";
             outputBox.Text = AppendLine(outputBox.Text, "Remote discovery loaded " + peers.Count + " peer rows.");
         }
 
@@ -1323,7 +1329,7 @@ namespace QexowCamGui
 
         public static string Version
         {
-            get { return "2.1.38"; }
+            get { return "2.1.39"; }
         }
     }
 }

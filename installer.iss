@@ -1,6 +1,6 @@
 [Setup]
 AppName=Qexow CAM
-AppVersion=2.1.38
+AppVersion=2.1.39
 DefaultDirName={autopf}\Qexow CAM
 DefaultGroupName=Qexow CAM
 OutputDir=dist
@@ -55,6 +55,7 @@ Type: files; Name: "{app}\tray_windows_release.exe"
 Type: files; Name: "{app}\cam-core.exe"
 Type: files; Name: "{app}\cam-bundle.cjs"
 Type: files; Name: "{app}\daemon-entry.js"
+Type: files; Name: "{app}\query_threads.py"
 Type: files; Name: "{userstartup}\CodexAgentManager.cmd"
 Type: files; Name: "{userstartup}\QexowCam.cmd"
 Type: files; Name: "{userstartup}\Codex Agent Manager.cmd"
@@ -63,6 +64,7 @@ Type: files; Name: "{localappdata}\Qexow CAM\qexow-tray-proof.exe"
 Type: files; Name: "{localappdata}\Qexow CAM\qexow-cam-gui.exe"
 Type: files; Name: "{localappdata}\Qexow CAM\cam-bundle.cjs"
 Type: files; Name: "{localappdata}\Qexow CAM\daemon-entry.js"
+Type: files; Name: "{localappdata}\Qexow CAM\query_threads.py"
 Type: files; Name: "{localappdata}\Qexow CAM\cam-tray.exe"
 Type: files; Name: "{localappdata}\Qexow CAM\tray_windows_release.exe"
 Type: dirifempty; Name: "{localappdata}\Qexow CAM"
@@ -71,6 +73,7 @@ Type: files; Name: "{localappdata}\Programs\Codex Agent Manager\qexow-tray-proof
 Type: files; Name: "{localappdata}\Programs\Codex Agent Manager\qexow-cam-gui.exe"
 Type: files; Name: "{localappdata}\Programs\Codex Agent Manager\cam-bundle.cjs"
 Type: files; Name: "{localappdata}\Programs\Codex Agent Manager\daemon-entry.js"
+Type: files; Name: "{localappdata}\Programs\Codex Agent Manager\query_threads.py"
 Type: files; Name: "{localappdata}\Programs\Codex Agent Manager\cam-tray.exe"
 Type: files; Name: "{localappdata}\Programs\Codex Agent Manager\tray_windows_release.exe"
 Type: dirifempty; Name: "{localappdata}\Programs\Codex Agent Manager"
@@ -79,6 +82,7 @@ Type: files; Name: "{localappdata}\Programs\Qexow CAM\qexow-cam-gui.exe"
 Type: files; Name: "{localappdata}\Programs\Qexow CAM\qexow-tray-proof.exe"
 Type: files; Name: "{localappdata}\Programs\Qexow CAM\cam-bundle.cjs"
 Type: files; Name: "{localappdata}\Programs\Qexow CAM\daemon-entry.js"
+Type: files; Name: "{localappdata}\Programs\Qexow CAM\query_threads.py"
 Type: files; Name: "{localappdata}\Programs\Qexow CAM\cam-tray.exe"
 Type: files; Name: "{localappdata}\Programs\Qexow CAM\tray_windows_release.exe"
 Type: files; Name: "{localappdata}\Programs\Qexow CAM\install-remote.sh"
@@ -387,6 +391,7 @@ end;
 
 procedure RemoveKnownInstallRoots();
 begin
+  RemoveDirIfExists(ExpandConstant('{pf}\Qexow CAM'));
   RemoveDirIfExists(ExpandConstant('{localappdata}\Programs\Qexow CAM'));
   RemoveDirIfExists(ExpandConstant('{localappdata}\Programs\Codex Agent Manager'));
   RemoveDirIfExists(ExpandConstant('{localappdata}\Qexow CAM'));

@@ -22,9 +22,9 @@ const installerShipsQueryThreads =
   installer.includes('Source: "query_threads.py"');
 
 const checks = [
-  ["package version is 2.1.38", pkg.version === "2.1.38"],
+  ["package version is 2.1.39", pkg.version === "2.1.39"],
   ["config uses explicit default CAM port 37631", config.includes("export const DEFAULT_CAM_PORT = 37631") && config.includes("const port = configuredPort || DEFAULT_CAM_PORT")],
-  ["daemon exposes CAM_VERSION 2.1.38", daemon.includes('const CAM_VERSION = "2.1.38";')],
+  ["daemon exposes CAM_VERSION 2.1.39", daemon.includes('const CAM_VERSION = "2.1.39";')],
   ["daemon health includes version", daemon.includes("version: CAM_VERSION")],
   ["daemon supports strict thread-not-found detection", daemon.includes("STRICT_THREAD_NOT_FOUND")],
   ["daemon strict send does not queue unresolved targets", daemon.includes("strict send cannot deliver") && daemon.includes("message.failed.strict")],
