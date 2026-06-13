@@ -1,6 +1,6 @@
 [Setup]
 AppName=Qexow CAM
-AppVersion=2.1.26
+AppVersion=2.1.27
 DefaultDirName={autopf}\Qexow CAM
 DefaultGroupName=Qexow CAM
 OutputDir=dist
@@ -72,6 +72,17 @@ Type: files; Name: "{localappdata}\Programs\Codex Agent Manager\daemon-entry.js"
 Type: files; Name: "{localappdata}\Programs\Codex Agent Manager\cam-tray.exe"
 Type: files; Name: "{localappdata}\Programs\Codex Agent Manager\tray_windows_release.exe"
 Type: dirifempty; Name: "{localappdata}\Programs\Codex Agent Manager"
+Type: files; Name: "{localappdata}\Programs\Qexow CAM\cam.exe"
+Type: files; Name: "{localappdata}\Programs\Qexow CAM\qexow-cam-gui.exe"
+Type: files; Name: "{localappdata}\Programs\Qexow CAM\qexow-tray-proof.exe"
+Type: files; Name: "{localappdata}\Programs\Qexow CAM\cam-bundle.cjs"
+Type: files; Name: "{localappdata}\Programs\Qexow CAM\daemon-entry.js"
+Type: files; Name: "{localappdata}\Programs\Qexow CAM\cam-tray.exe"
+Type: files; Name: "{localappdata}\Programs\Qexow CAM\tray_windows_release.exe"
+Type: files; Name: "{localappdata}\Programs\Qexow CAM\install-remote.sh"
+Type: files; Name: "{localappdata}\Programs\Qexow CAM\unins000.exe"
+Type: files; Name: "{localappdata}\Programs\Qexow CAM\unins000.dat"
+Type: dirifempty; Name: "{localappdata}\Programs\Qexow CAM"
 
 [UninstallRun]
 Filename: "taskkill"; Parameters: "/F /T /IM cam-tray.exe"; Flags: runhidden; RunOnceId: "KillOldTray"
@@ -117,6 +128,15 @@ begin
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
+procedure KillCamProcessesByInstallPath();
+var
+  ResultCode: Integer;
+begin
+  Exec('powershell.exe',
+    '-NoProfile -ExecutionPolicy Bypass -Command "$targets = @(''cam.exe'',''qexow-cam-gui.exe'',''cam-tray.exe'',''qexow-tray-proof.exe'',''tray_windows_release.exe'',''cam-core.exe''); Get-CimInstance Win32_Process | Where-Object { $targets -contains $_.Name -and ($_.ExecutablePath -like ''*\\Qexow CAM\\*'' -or $_.ExecutablePath -like ''*\\Codex Agent Manager\\*'' -or $_.CommandLine -like ''*\\Qexow CAM\\*'' -or $_.CommandLine -like ''*\\Codex Agent Manager\\*'') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
 procedure DeleteIfExists(PathName: string);
 begin
   if FileExists(PathName) then begin
@@ -147,6 +167,13 @@ begin
     end;
     Dest := BackupDir + '\' + ExtractFileName(PathName) + '.bak-' + Stamp;
     RenameFile(PathName, Dest);
+  end;
+end;
+
+procedure RemoveDirIfExists(PathName: string);
+begin
+  if DirExists(PathName) then begin
+    DelTree(PathName, True, True, True);
   end;
 end;
 
@@ -194,6 +221,7 @@ begin
   KillProcess('cam-core.exe');
   KillProcess('cam-tray.exe');
   KillProcess('tray_windows_release.exe');
+  KillCamProcessesByInstallPath();
   KillLegacyNodeDaemon();
 
   // Remove old task/startup launch points so only the current tray command starts.
@@ -203,6 +231,9 @@ begin
   DeleteIfExists(ExpandConstant('{userstartup}\CodexAgentManager.cmd'));
   DeleteIfExists(ExpandConstant('{userstartup}\QexowCam.cmd'));
   DeleteIfExists(ExpandConstant('{userstartup}\Codex Agent Manager.cmd'));
+  RemoveDirIfExists(ExpandConstant('{localappdata}\Programs\Qexow CAM'));
+  RemoveDirIfExists(ExpandConstant('{localappdata}\Programs\Codex Agent Manager'));
+  RemoveDirIfExists(ExpandConstant('{localappdata}\Qexow CAM'));
   ResetVolatileCamState();
 
   Result := True;
