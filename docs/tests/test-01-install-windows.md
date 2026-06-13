@@ -20,7 +20,7 @@
   ```json
   {
     "ok": true,
-    "version": "2.1.23",
+    "version": "2.1.24",
     "nodeName": "RyzenLaptop",
     "startedAt": "<fresh install timestamp>",
     "appServerInitialized": true
