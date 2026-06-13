@@ -22,9 +22,9 @@ const installerShipsQueryThreads =
   installer.includes('Source: "query_threads.py"');
 
 const checks = [
-  ["package version is 2.1.39", pkg.version === "2.1.39"],
+  ["package version is 2.1.40", pkg.version === "2.1.40"],
   ["config uses explicit default CAM port 37631", config.includes("export const DEFAULT_CAM_PORT = 37631") && config.includes("const port = configuredPort || DEFAULT_CAM_PORT")],
-  ["daemon exposes CAM_VERSION 2.1.39", daemon.includes('const CAM_VERSION = "2.1.39";')],
+  ["daemon exposes CAM_VERSION 2.1.40", daemon.includes('const CAM_VERSION = "2.1.40";')],
   ["daemon health includes version", daemon.includes("version: CAM_VERSION")],
   ["daemon supports strict thread-not-found detection", daemon.includes("STRICT_THREAD_NOT_FOUND")],
   ["daemon strict send does not queue unresolved targets", daemon.includes("strict send cannot deliver") && daemon.includes("message.failed.strict")],
@@ -48,6 +48,7 @@ const checks = [
   ["generated skill documents diagnostic reply pattern", antigravity.includes("cam-gui-test-reply") && antigravity.includes("--correlation-id")],
   ["generated skill avoids PowerShell helper instructions", !antigravity.includes("Send-AgentMessage.ps1") && !antigravity.includes("Check-AgentMessages.ps1") && antigravity.includes("cam send")],
   ["daemon prompt does not offer direct CAM HTTP", !daemon.includes("send via CAM HTTP") && daemon.includes("Do not use direct CAM HTTP")],
+  ["daemon GUI test prompt routes reply to mailbox target", daemon.includes('const replyTargetAgent = message.messageType === GUI_TEST_MESSAGE_TYPE') && daemon.includes('CAM_TEST_MAILBOX_AGENT') && daemon.includes('Use messageType "${GUI_TEST_REPLY_MESSAGE_TYPE}".')],
   ["GUI sends strict diagnostic payload", gui.includes('payload["strict"] = true;')],
   ["GUI asks Missouri semantic challenge", gui.includes("capital of Missouri") && gui.includes("Hello, how is your day?")],
   ["GUI requires Jefferson semantic answer", gui.includes("BodyContainsMissouriAnswer") && gui.includes("Jefferson City")],

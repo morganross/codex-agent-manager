@@ -47,7 +47,7 @@ import { discoverPeerFactsFromMarkdown, discoverSshKeyPathsFromMarkdown } from "
 
 const CAM_TEST_MAILBOX_AGENT = "CAM test, Kexau CAM test suite mailbox";
 const MAILBOX_ONLY_THREAD_SOURCES = new Set(["mailbox", "gui-only"]);
-const CAM_VERSION = "2.1.39";
+const CAM_VERSION = "2.1.40";
 const STRICT_THREAD_NOT_FOUND = /thread not found/i;
 const GUI_TEST_MESSAGE_TYPE = "cam-gui-test";
 const GUI_TEST_REPLY_MESSAGE_TYPE = "cam-gui-test-reply";
@@ -1222,6 +1222,13 @@ export class AgentManagerDaemon {
         ].join("\n")
       : "";
 
+      const replyTargetAgent = message.messageType === GUI_TEST_MESSAGE_TYPE
+        ? CAM_TEST_MAILBOX_AGENT
+        : message.sourceAgent;
+      const replyTypeInstruction = message.messageType === GUI_TEST_MESSAGE_TYPE
+        ? ` Use messageType "${GUI_TEST_REPLY_MESSAGE_TYPE}".`
+        : "";
+
       const prompt = [
       "[Qexow CAM message]",
       `messageId: ${message.messageId}`,
@@ -1234,7 +1241,7 @@ export class AgentManagerDaemon {
       message.body,
       pendingText,
       "",
-      `[To reply to this message, use the qexow-cam-messaging skill and send to targetAgent "${message.sourceAgent}" with correlationId "${message.correlationId || ""}". Do not use direct CAM HTTP or older codex-agent-manager paths.]`
+      `[To reply to this message, use the qexow-cam-messaging skill and send to targetAgent "${replyTargetAgent}" with correlationId "${message.correlationId || ""}".${replyTypeInstruction} Do not use direct CAM HTTP or older codex-agent-manager paths.]`
     ].filter(Boolean).join("\n");
 
     try {
