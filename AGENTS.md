@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **codex-agent-manager** (734 symbols, 1741 relationships, 62 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **qexow-cam** (872 symbols, 2028 relationships, 74 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
@@ -24,10 +24,10 @@ This project is indexed by GitNexus as **codex-agent-manager** (734 symbols, 174
 
 | Resource | Use for |
 |----------|---------|
-| `gitnexus://repo/codex-agent-manager/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/codex-agent-manager/clusters` | All functional areas |
-| `gitnexus://repo/codex-agent-manager/processes` | All execution flows |
-| `gitnexus://repo/codex-agent-manager/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/qexow-cam/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/qexow-cam/clusters` | All functional areas |
+| `gitnexus://repo/qexow-cam/processes` | All execution flows |
+| `gitnexus://repo/qexow-cam/process/{name}` | Step-by-step execution trace |
 
 ## CLI
 
