@@ -6,10 +6,10 @@ on:
       - 'v*'
 
 jobs:
-  build:
+  build_windows:
     runs-on: windows-latest
     permissions:
-      contents: write
+      contents: read
 
     steps:
     - uses: actions/checkout@v4
@@ -33,13 +33,11 @@ jobs:
         $binDir = Join-Path $homeDir ".bin"
         New-Item -ItemType Directory -Force -Path $binDir
 
-        # Download and extract Linux x64 Node.js base
         Write-Host "Downloading Linux x64 base..."
         $x64Zip = Join-Path $binDir "node-v22.22.3-linux-x64.tar.gz"
         Invoke-WebRequest -Uri "https://nodejs.org/dist/v22.22.3/node-v22.22.3-linux-x64.tar.gz" -OutFile $x64Zip -ErrorAction Stop
         tar -xf $x64Zip -C $binDir "node-v22.22.3-linux-x64/bin/node"
 
-        # Download and extract Linux arm64 Node.js base
         Write-Host "Downloading Linux arm64 base..."
         $arm64Zip = Join-Path $binDir "node-v22.22.3-linux-arm64.tar.gz"
         Invoke-WebRequest -Uri "https://nodejs.org/dist/v22.22.3/node-v22.22.3-linux-arm64.tar.gz" -OutFile $arm64Zip -ErrorAction Stop
@@ -119,8 +117,104 @@ jobs:
     - name: Delete standalone executable payloads
       run: npm run purge-standalone-exes
 
+    - name: Upload Windows release artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: qexow-cam-windows
+        path: dist/QexowCamSetup.exe
+
+  build_linux:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            deb_arch: amd64
+            node_dist: node-v22.22.3-linux-x64
+          - arch: arm64
+            deb_arch: arm64
+            node_dist: node-v22.22.3-linux-arm64
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Use Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22.x
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm install
+
+    - name: Verify strict CAM contract
+      run: npm run test:strict-contract
+
+    - name: Download target Node runtime
+      shell: bash
+      run: |
+        set -euxo pipefail
+        cd "$RUNNER_TEMP"
+        curl -fsSLO "https://nodejs.org/dist/v22.22.3/${{ matrix.node_dist }}.tar.gz"
+        tar -xzf "${{ matrix.node_dist }}.tar.gz"
+
+    - name: Build Linux package
+      shell: bash
+      run: |
+        set -euxo pipefail
+        npm run build:linux-package -- \
+          --arch "${{ matrix.arch }}" \
+          --node-bin "$RUNNER_TEMP/${{ matrix.node_dist }}/bin/node" \
+          --node-version "22.22.3"
+
+    - name: Inspect Linux package contents
+      shell: bash
+      run: |
+        set -euxo pipefail
+        dpkg-deb -c "dist/qexow-cam_"*"_"${{ matrix.deb_arch }}".deb"
+
+    - name: Smoke test Linux amd64 install
+      if: matrix.deb_arch == 'amd64'
+      shell: bash
+      run: |
+        set -euxo pipefail
+        sudo dpkg -i "dist/qexow-cam_"*"_"${{ matrix.deb_arch }}".deb"
+        test -x /usr/local/bin/cam
+        CAM_APP_ROOT=/opt/qexow-cam /usr/local/bin/cam init
+        CAM_APP_ROOT=/opt/qexow-cam /usr/local/bin/cam inventory export
+        test -f "$HOME/.qexow-cam/config.json"
+        test -f "$HOME/.qexow-cam/docs/README.md"
+        sudo CAM_PRESERVE_STATE=1 dpkg -i "dist/qexow-cam_"*"_"${{ matrix.deb_arch }}".deb"
+        test -x /usr/local/bin/cam
+        sudo dpkg -r qexow-cam
+        test ! -e /usr/local/bin/cam
+
+    - name: Upload Linux release artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: qexow-cam-linux-${{ matrix.deb_arch }}
+        path: dist/qexow-cam_*_${{ matrix.deb_arch }}.deb
+
+  publish_release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    needs:
+      - build_windows
+      - build_linux
+
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: release-artifacts
+
     - name: Publish to GitHub Releases
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          dist/QexowCamSetup.exe
+          release-artifacts/**/*.exe
+          release-artifacts/**/*.deb

@@ -20,19 +20,23 @@ import {
   appendEvent,
   appendMailbox,
   appendTestEvent,
+  canonicalizeTrustedInventoryAgents,
   getAgent,
   getPeer,
   listPeers,
   listAgents,
   loadRegistry,
+  saveRegistry,
+  saveLocalDiscoveries,
+  saveRemoteDiscoverySnapshot,
   markMailboxSurfaced,
   pendingMailbox,
   readMailbox,
-  saveRegistry,
   setAgent,
   upsertPeer,
   upsertAgent,
 } from "./registry.js";
+import { classifyThreadDiscovery, discoveryCounts } from "./discovery-policy.js";
 import { paths, writeJsonAtomic, readJson } from "./paths.js";
 import { logEvent, enforceRetention } from "./logger.js";
 import { bootstrapAntigravity } from "./antigravity.js";
@@ -47,12 +51,13 @@ import { discoverPeerFactsFromMarkdown, discoverSshKeyPathsFromMarkdown } from "
 
 const CAM_TEST_MAILBOX_AGENT = "CAM test, Kexau CAM test suite mailbox";
 const MAILBOX_ONLY_THREAD_SOURCES = new Set(["mailbox", "gui-only"]);
-const CAM_VERSION = "2.1.40";
+const CAM_VERSION = "2.1.41";
 const STRICT_THREAD_NOT_FOUND = /thread not found/i;
 const GUI_TEST_MESSAGE_TYPE = "cam-gui-test";
 const GUI_TEST_REPLY_MESSAGE_TYPE = "cam-gui-test-reply";
 const REMOTE_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_REMOTE_ROOTS = [
+  "/opt/qexow-cam",
   "/home/ubuntu/codex-agent-manager",
   "/root/codex-agent-manager",
 ];
@@ -655,6 +660,9 @@ export class AgentManagerDaemon {
         const agent = url.searchParams.get("agent");
         const wait = Number(url.searchParams.get("wait") || 0);
 
+        if (agent) {
+          await this.#harvestRemoteMailbox(agent);
+        }
         const messages = readMailbox(agent);
         if (messages.length > 0 || wait <= 0) {
           return json(res, 200, { ok: true, messages });
@@ -669,11 +677,14 @@ export class AgentManagerDaemon {
         // Hold the response! (Long Polling)
         return new Promise((resolve) => {
           let resolved = false;
+          let polling = false;
+          let pollTimer = null;
 
           const listener = (msg) => {
             if (resolved) return;
             if (msg === null) {
               resolved = true;
+              clearInterval(pollTimer);
               clearTimeout(timer);
               const idx = this.mailboxListeners.indexOf(listener);
               if (idx >= 0) this.mailboxListeners.splice(idx, 1);
@@ -683,6 +694,7 @@ export class AgentManagerDaemon {
             }
             if (!agent || msg.targetAgent === agent) {
               resolved = true;
+              clearInterval(pollTimer);
               clearTimeout(timer);
               const idx = this.mailboxListeners.indexOf(listener);
               if (idx >= 0) this.mailboxListeners.splice(idx, 1);
@@ -693,9 +705,28 @@ export class AgentManagerDaemon {
 
           this.mailboxListeners.push(listener);
 
+          pollTimer = setInterval(async () => {
+            if (resolved || polling || !agent) return;
+            polling = true;
+            try {
+              const imported = await this.#harvestRemoteMailbox(agent);
+              if (resolved || !imported.length) return;
+              resolved = true;
+              clearInterval(pollTimer);
+              clearTimeout(timer);
+              const idx = this.mailboxListeners.indexOf(listener);
+              if (idx >= 0) this.mailboxListeners.splice(idx, 1);
+              json(res, 200, { ok: true, messages: readMailbox(agent) });
+              resolve();
+            } finally {
+              polling = false;
+            }
+          }, 2000);
+
           const timer = setTimeout(() => {
             if (resolved) return;
             resolved = true;
+            clearInterval(pollTimer);
             const idx = this.mailboxListeners.indexOf(listener);
             if (idx >= 0) this.mailboxListeners.splice(idx, 1);
             json(res, 200, { ok: true, messages: [] });
@@ -842,12 +873,13 @@ export class AgentManagerDaemon {
       const registry = listAgents(this.config);
       const existingThreadMap = new Map();
       for (const agent of registry) {
-        if (agent.threadId) {
+        if (agent.threadId && !String(agent.route || "").startsWith("peer:")) {
           existingThreadMap.set(agent.threadId, agent);
         }
       }
 
       const activeThreadIds = new Set();
+      const discoveryRows = [];
 
       const normalizeName = (text) => {
         if (!text) return "";
@@ -876,18 +908,50 @@ export class AgentManagerDaemon {
         }
 
         let cwd = thread.cwd;
-        if (!cwd || cwd === "outside-of-project") {
-          const errMsg = `Thread ${tid} (${name}) is missing a valid workspace path. Skipping registry sync.`;
+        if (cwd && cwd.startsWith("\\\\?\\")) {
+          cwd = cwd.substring(4);
+        }
+
+        const classification = classifyThreadDiscovery(thread, name, cwd);
+        discoveryRows.push({
+          id: tid,
+          name,
+          title: thread.title || "",
+          cwd: cwd || "",
+          source: thread.source || null,
+          sourceKind: classification.sourceKind || null,
+          threadSource: thread.thread_source || "codex",
+          nodeName: thread.nodeName || this.config.nodeName,
+          route: thread.route || "",
+          transport: thread.transport || "",
+          disposition: classification.disposition,
+          reason: classification.reason,
+          approved: classification.approved === true,
+          rolloutPath: thread.rollout_path || null,
+          updatedAt: thread.updated_at || null,
+          discoveredAt: new Date().toISOString(),
+        });
+
+        if (!classification.approved) {
+          const errMsg = `Thread ${tid} (${name}) is ${classification.disposition}: ${classification.reason}. Skipping active agent promotion.`;
           const previous = this.skippedThreadReasons.get(tid);
           if (previous !== errMsg) {
-            this.log("sync.agent.error", { threadId: tid, name, error: errMsg });
-            appendEvent("sync.agent.error", { threadId: tid, name, error: errMsg, skipped: true, reason: "missing-workspace" });
+            this.log("sync.agent.classified_non_approved", {
+              threadId: tid,
+              name,
+              disposition: classification.disposition,
+              reason: classification.reason,
+            });
+            appendEvent("sync.agent.classified_non_approved", {
+              threadId: tid,
+              name,
+              skipped: true,
+              disposition: classification.disposition,
+              reason: classification.reason,
+            });
             this.skippedThreadReasons.set(tid, errMsg);
           }
           continue;
-        }
-        if (cwd.startsWith("\\\\?\\")) {
-          cwd = cwd.substring(4);
         }
 
         if (existingThreadMap.has(tid)) {
@@ -928,6 +992,9 @@ export class AgentManagerDaemon {
                   hostKind: thread.hostKind,
                   transport: thread.transport,
                   route: thread.route,
+                  discoveryDisposition: classification.disposition,
+                  discoveryReason: classification.reason,
+                  approvedForSync: true,
                 });
                 this.threadToAgent.set(tid, uniqueName);
                 this.log("sync.agent.renamed.created-new", { oldName: agent.name, newName: uniqueName, threadId: tid });
@@ -948,6 +1015,9 @@ export class AgentManagerDaemon {
             transport: thread.transport,
             route: thread.route,
             status: agent.status || "idle",
+            discoveryDisposition: classification.disposition,
+            discoveryReason: classification.reason,
+            approvedForSync: true,
           });
           continue;
         }
@@ -974,6 +1044,9 @@ export class AgentManagerDaemon {
             hostKind: thread.hostKind,
             transport: thread.transport,
             route: thread.route,
+            discoveryDisposition: classification.disposition,
+            discoveryReason: classification.reason,
+            approvedForSync: true,
           });
           this.threadToAgent.set(tid, uniqueName);
           appendEvent("agent.created", { agent });
@@ -982,10 +1055,43 @@ export class AgentManagerDaemon {
           this.log("sync.agent.create.failed", { threadId: tid, error: e.message });
         }
       }
-      this.log("sync.agent.prune.skipped", { reason: "discovery is additive to avoid deleting active local agents", skippedThreads: this.skippedThreadReasons.size });
+      this.#removeNonApprovedLocalAgents(discoveryRows);
+      const localDiscoveries = saveLocalDiscoveries(this.config, discoveryRows, "native-thread-discovery");
+      this.log("sync.discovery.classified", {
+        counts: localDiscoveries.counts,
+      });
+      this.log("sync.agent.prune.skipped", { reason: "discovery is additive to avoid deleting active approved local agents", skippedThreads: this.skippedThreadReasons.size });
     } catch (e) {
       this.log("sync.apply.failed", { error: e.message });
     }
+  }
+
+  #removeNonApprovedLocalAgents(discoveryRows) {
+    const rejectedThreadIds = new Set((discoveryRows || [])
+      .filter((row) => row.approved !== true && row.id)
+      .map((row) => row.id));
+    if (!rejectedThreadIds.size) return;
+    const registry = loadRegistry(this.config);
+    let changed = false;
+    for (const [name, agent] of Object.entries(registry.agents || {})) {
+      if (!agent?.threadId || !rejectedThreadIds.has(agent.threadId)) continue;
+      if (String(agent.route || "").startsWith("peer:")) continue;
+      if (agent.threadSource === "mailbox") continue;
+      delete registry.agents[name];
+      changed = true;
+      this.threadToAgent.delete(agent.threadId);
+      this.log("sync.agent.demoted", {
+        name,
+        threadId: agent.threadId,
+        reason: "local-discovery-not-approved",
+      });
+      appendEvent("sync.agent.demoted", {
+        name,
+        threadId: agent.threadId,
+        reason: "local-discovery-not-approved",
+      });
+    }
+    if (changed) saveRegistry(registry);
   }
 
   async #startThread(agent) {
@@ -1045,11 +1151,6 @@ export class AgentManagerDaemon {
     const messageType = existingMessage ? existingMessage.messageType : (body?.messageType || null);
 
     if (targetAgentObj?.route && String(targetAgentObj.route).startsWith("peer:")) {
-      if (messageType === GUI_TEST_MESSAGE_TYPE) {
-        const failed = this.#buildFailedMessage(body, targetAgent, "remote mirrored agents do not support GUI round-trip tests yet; use remote-observe diagnostics");
-        if (failed.messageType === GUI_TEST_MESSAGE_TYPE) appendTestEvent(failed.correlationId, "failed", { error: failed.error, outbound: failed });
-        return { ok: false, delivered: false, queued: false, error: failed.error, message: failed };
-      }
       return this.#sendRemoteMirrorMessage({
         body,
         existingMessage,
@@ -1259,6 +1360,7 @@ export class AgentManagerDaemon {
           input: textInput(prompt),
           cwd: target.cwd,
           approvalPolicy: "never",
+          sandbox: "danger-full-access",
           ...this.#runtimeSettings(target),
         }, 60000);
         message.delivery = "started";
@@ -1515,6 +1617,29 @@ export class AgentManagerDaemon {
 
   async #syncSinglePeer(peer) {
     const peerName = peer.name;
+    if (this.#isSelfPeer(peer)) {
+      this.#pruneMirroredAgentsForPeer(peerName, []);
+      upsertPeer(this.config, peerName, {
+        ...getPeer(this.config, peerName),
+        remoteSync: {
+          ...(getPeer(this.config, peerName)?.remoteSync || {}),
+          lastAttemptAt: new Date().toISOString(),
+          lastStatus: "skipped-self",
+          lastError: null,
+          syncedAt: new Date().toISOString(),
+          mirroredAgents: [],
+        },
+      });
+      this.log("peer.sync.skipped_self", {
+        peerName,
+        ssh: peer?.ssh || null,
+      });
+      appendEvent("peer.sync.skipped_self", {
+        peerName,
+        ssh: peer?.ssh || null,
+      });
+      return { ok: true, peerName, skipped: "self" };
+    }
     const remoteRoot = await this.resolveRemoteRoot(peerName, peer);
     if (!remoteRoot) {
       const error = "unable to locate remote CAM manager root";
@@ -1557,6 +1682,11 @@ export class AgentManagerDaemon {
         syncedAt: new Date().toISOString(),
         remoteRoot: remoteRoot || null,
         remoteInventorySource: remoteInventoryResult.source,
+        remoteInventorySchema: remoteInventory?.inventorySchema || 1,
+        remoteInventoryDegraded: remoteInventoryResult.degraded === true,
+        remoteDiscoveryCounts: result.discoveryCounts,
+        remoteRejectedDiscoveries: result.rejectedDiscoveries.length,
+        remoteApprovedDiscoveries: result.approvedDiscoveries.length,
         remoteNodeName: remoteInventory?.nodeName || null,
         mirroredAgents: result.mirroredAgents,
       },
@@ -1564,12 +1694,16 @@ export class AgentManagerDaemon {
     this.log("peer.sync.complete", {
       peerName,
       mirroredAgents: result.mirroredAgents.length,
+      remoteDiscoveryCounts: result.discoveryCounts,
+      remoteInventoryDegraded: remoteInventoryResult.degraded === true,
       remoteRoot: remoteRoot || null,
       remoteNodeName: remoteInventory?.nodeName || null,
     });
     appendEvent("peer.sync.complete", {
       peerName,
       mirroredAgents: result.mirroredAgents.length,
+      remoteDiscoveryCounts: result.discoveryCounts,
+      remoteInventoryDegraded: remoteInventoryResult.degraded === true,
       remoteRoot: remoteRoot || null,
       remoteNodeName: remoteInventory?.nodeName || null,
     });
@@ -1584,7 +1718,23 @@ export class AgentManagerDaemon {
   }
 
   #ingestRemotePeerRegistry(peer, remoteRegistry, remoteRoot) {
-    const remoteAgents = Object.values(remoteRegistry?.agents || {});
+    const remoteAgents = canonicalizeTrustedInventoryAgents(Object.values(remoteRegistry?.agents || {}));
+    const rawDiscoveries = remoteRegistry?.discoveries?.local?.rows || [];
+    const counts = remoteRegistry?.counts?.localDiscoveries || remoteRegistry?.discoveries?.local?.counts || discoveryCounts(rawDiscoveries);
+    const approvedDiscoveries = rawDiscoveries.filter((row) => row?.approved === true || row?.disposition === "approved");
+    const rejectedDiscoveries = rawDiscoveries.filter((row) => !(row?.approved === true || row?.disposition === "approved"));
+    saveRemoteDiscoverySnapshot(this.config, peer.name, {
+      source: remoteRegistry?.exportPolicy || "legacy-or-unknown",
+      inventorySchema: remoteRegistry?.inventorySchema || 1,
+      remoteNodeName: remoteRegistry?.nodeName || peer.name,
+      remoteRoot: remoteRoot || null,
+      counts,
+      rawDiscoveries,
+      approvedDiscoveries,
+      rejectedDiscoveries,
+      approvedAgents: remoteAgents,
+    });
+    this.#pruneMirroredAgentsForPeer(peer.name, remoteAgents);
     const mirroredAgents = [];
     for (const remoteAgent of remoteAgents) {
       if (!remoteAgent?.name) continue;
@@ -1610,6 +1760,9 @@ export class AgentManagerDaemon {
         remoteNodeName: remoteRegistry?.nodeName || peer.name,
         remoteRoot: remoteRoot || null,
         discoveredBy: "remote-cam-sync",
+        discoveryDisposition: "approved",
+        discoveryReason: remoteAgent.discoveryReason || "remote-approved-agent",
+        approvedForSync: true,
         discoveredAt: new Date().toISOString(),
       });
       mirroredAgents.push({
@@ -1621,31 +1774,110 @@ export class AgentManagerDaemon {
       this.threadToAgent.delete(remoteAgent.threadId);
       void mirrored;
     }
-    return { mirroredAgents };
+    return { mirroredAgents, discoveryCounts: counts, approvedDiscoveries, rejectedDiscoveries };
+  }
+
+  #pruneMirroredAgentsForPeer(peerName, remoteAgents) {
+    const registry = loadRegistry(this.config);
+    const allowedNames = new Set(remoteAgents.map((agent) => this.#remoteMirrorName(peerName, agent.name)));
+    const allowedThreadIds = new Set(remoteAgents.map((agent) => agent.threadId).filter(Boolean));
+    let changed = false;
+    for (const [name, agent] of Object.entries(registry.agents || {})) {
+      if (String(agent?.route || "") !== `peer:${peerName}`) continue;
+      const keepByName = allowedNames.has(name);
+      const keepByThread = agent?.threadId ? allowedThreadIds.has(agent.threadId) : false;
+      if (keepByName && (!agent?.threadId || keepByThread)) continue;
+      delete registry.agents[name];
+      changed = true;
+      this.log("peer.sync.pruned_mirror", {
+        peerName,
+        name,
+        threadId: agent?.threadId || null,
+        reason: keepByThread ? "renamed-or-recursive-alias" : "not-in-validated-remote-export",
+      });
+      appendEvent("peer.sync.pruned_mirror", {
+        peerName,
+        name,
+        threadId: agent?.threadId || null,
+        reason: keepByThread ? "renamed-or-recursive-alias" : "not-in-validated-remote-export",
+      });
+    }
+    if (changed) saveRegistry(registry);
   }
 
   #remoteMirrorName(peerName, remoteAgentName) {
     return `${peerName}::${remoteAgentName}`;
   }
 
+  #isSelfPeer(peer) {
+    const ssh = String(peer?.ssh || "").trim();
+    const host = ssh.includes("@") ? ssh.split("@")[1] : ssh;
+    const localHosts = new Set([
+      "localhost",
+      "127.0.0.1",
+      "::1",
+      String(this.config?.nodeName || "").trim().toLowerCase(),
+      String(process.env.CAM_NODE_NAME || "").trim().toLowerCase(),
+      String(process.env.HOSTNAME || "").trim().toLowerCase(),
+      String(process.env.COMPUTERNAME || "").trim().toLowerCase(),
+      String(os.hostname?.() || "").trim().toLowerCase(),
+    ].filter(Boolean));
+    if (host && localHosts.has(String(host).trim().toLowerCase())) return true;
+
+    const localIps = new Set();
+    try {
+      const interfaces = os.networkInterfaces?.() || {};
+      for (const rows of Object.values(interfaces)) {
+        for (const row of rows || []) {
+          if (row?.address) localIps.add(String(row.address).trim());
+        }
+      }
+    } catch {
+      // Best effort only.
+    }
+    const peerIps = new Set([
+      host,
+      ...(Array.isArray(peer?.observedPrivateIps) ? peer.observedPrivateIps : []),
+      ...(Array.isArray(peer?.docDiscovery?.candidateIps) ? peer.docDiscovery.candidateIps : []),
+      ...(Array.isArray(peer?.docDiscovery?.candidatePrivateIps) ? peer.docDiscovery.candidatePrivateIps : []),
+    ].filter(Boolean).map((value) => String(value).trim()));
+    for (const ip of peerIps) {
+      if (localIps.has(ip)) return true;
+    }
+    return false;
+  }
+
+  #remoteCamShell(remoteRoot, argv) {
+    const args = argv.map((part) => sq(part)).join(" ");
+    const installed = remoteRoot && /^\/opt\/qexow-cam(?:\/|$)/.test(remoteRoot)
+      ? `CAM_APP_ROOT=${sq(remoteRoot)} /usr/local/bin/cam ${args}`
+      : null;
+    const legacyRoot = remoteRoot || "/home/ubuntu/codex-agent-manager";
+    const legacy = `cd ${sq(legacyRoot)} && node ${sq("./bin/cam.js")} ${args}`;
+    if (installed) return installed;
+    return [
+      `if command -v cam >/dev/null 2>&1; then cam ${args}`,
+      `elif [ -x /usr/local/bin/cam ]; then /usr/local/bin/cam ${args}`,
+      `elif [ -d ${sq(legacyRoot)} ]; then ${legacy}`,
+      "else echo __CAM_REMOTE_MISSING__; exit 45",
+      "fi",
+    ].join("; ");
+  }
+
   async #sshRunCamSend(peer, remoteRoot, payload) {
     const root = remoteRoot || this.#remoteManagerRoot(peer);
-    const command = [
-      `cd ${sq(root)}`,
-      "&&",
-      "node",
-      sq("./bin/cam.js"),
+    const command = this.#remoteCamShell(root, [
       "send",
-      sq(payload.targetAgent),
-      sq(payload.message),
+      payload.targetAgent,
+      payload.message,
       "--from",
-      sq(payload.sourceAgent || "operator"),
+      payload.sourceAgent || "operator",
       "--source-node",
-      sq(payload.sourceNode || this.config.nodeName),
-      ...(payload.correlationId ? ["--correlation-id", sq(payload.correlationId)] : []),
-      ...(payload.messageType ? ["--message-type", sq(payload.messageType)] : []),
+      payload.sourceNode || this.config.nodeName,
+      ...(payload.correlationId ? ["--correlation-id", payload.correlationId] : []),
+      ...(payload.messageType ? ["--message-type", payload.messageType] : []),
       ...(payload.strict ? ["--strict"] : []),
-    ].join(" ");
+    ]);
     this.log("peer.remote_send.command", {
       peerName: peer.name,
       command,
@@ -1655,19 +1887,141 @@ export class AgentManagerDaemon {
 
   async #sshRunCamInventoryExport(peer, remoteRoot) {
     const root = remoteRoot || this.#remoteManagerRoot(peer);
-    const command = [
-      `cd ${sq(root)}`,
-      "&&",
-      "node",
-      sq("./bin/cam.js"),
-      "inventory",
-      "export",
-    ].join(" ");
+    const command = this.#remoteCamShell(root, ["inventory", "export"]);
     this.log("peer.remote_inventory.command", {
       peerName: peer.name,
       command,
     });
     return this.#probeRemoteCommand(peer, command, 20000);
+  }
+
+  async #sshRunCamInbox(peer, remoteRoot, targetAgent) {
+    const root = remoteRoot || this.#remoteManagerRoot(peer);
+    const command = this.#remoteCamShell(root, ["inbox", targetAgent]);
+    this.log("peer.remote_inbox.command", {
+      peerName: peer.name,
+      targetAgent,
+      command,
+    });
+    return this.#probeRemoteCommand(peer, command, 20000);
+  }
+
+  #relayImportedMessageId(peerName, remoteMessageId) {
+    return `relay:${peerName}:${remoteMessageId}`;
+  }
+
+  #deriveRelayedSourceAgent(remoteMessage, fallbackAgent = null) {
+    const body = String(remoteMessage?.body || "");
+    const equalsMatch = body.match(/\bagent=([A-Za-z0-9._:-]+)\b/i);
+    if (equalsMatch?.[1]) return equalsMatch[1];
+    const labelMatch = body.match(/\bAgent:\s*([A-Za-z0-9._:-]+)/i);
+    if (labelMatch?.[1]) return labelMatch[1];
+    return fallbackAgent || remoteMessage?.sourceAgent || "operator";
+  }
+
+  async #harvestRemoteMailbox(targetAgent) {
+    if (!targetAgent) return [];
+    const peers = listPeers(this.config).filter((peer) =>
+      peer?.transport === "ssh" &&
+      String(peer?.ssh || "").includes("@") &&
+      peer?.key &&
+      !this.#isSelfPeer(peer)
+    );
+    if (!peers.length) return [];
+
+    const existingRows = readMailbox(targetAgent);
+    const seenRelayKeys = new Set(
+      existingRows
+        .map((row) => row?.relayKey || (row?.relayedFromPeerName && row?.remoteMessageId ? `${row.relayedFromPeerName}:${row.remoteMessageId}` : null))
+        .filter(Boolean)
+    );
+    const imported = [];
+
+    for (const peer of peers) {
+      try {
+        const remoteRoot = await this.resolveRemoteRoot(peer.name, peer);
+        if (!remoteRoot) continue;
+        const inboxResult = await this.#sshRunCamInbox(peer, remoteRoot, targetAgent);
+        if (!inboxResult.ok) continue;
+
+        let remoteRows;
+        try {
+          remoteRows = JSON.parse(inboxResult.text);
+        } catch (error) {
+          this.log("peer.remote_inbox.invalid_json", {
+            peerName: peer.name,
+            targetAgent,
+            error: error.message,
+          });
+          continue;
+        }
+        if (!Array.isArray(remoteRows)) continue;
+
+        for (const row of remoteRows) {
+          if (!row || row.targetAgent !== targetAgent) continue;
+          if (String(row.delivery || "").toLowerCase() !== "received") continue;
+          const remoteMessageId = String(row.messageId || "").trim();
+          if (!remoteMessageId) continue;
+          const relayKey = `${peer.name}:${remoteMessageId}`;
+          if (seenRelayKeys.has(relayKey)) continue;
+
+          const importedRow = {
+            ...row,
+            messageId: this.#relayImportedMessageId(peer.name, remoteMessageId),
+            remoteMessageId,
+            relayKey,
+            relayedFromPeerName: peer.name,
+            relayedAt: new Date().toISOString(),
+            targetNode: this.config.nodeName,
+            sourceNode: row.sourceNode || peer.remoteSync?.remoteNodeName || peer.name,
+            sourceRoute: `peer:${peer.name}`,
+            sourceAgent: this.#deriveRelayedSourceAgent(row, row.sourceAgent),
+            relayObservedSourceAgent: row.sourceAgent || null,
+            relayObservedTargetAgent: row.targetAgent || null,
+            delivery: "received",
+          };
+          appendMailbox(importedRow);
+          appendEvent("message.received.relayed", importedRow);
+          if (
+            targetAgent === CAM_TEST_MAILBOX_AGENT &&
+            (
+              String(importedRow.messageType || "").toLowerCase() === GUI_TEST_REPLY_MESSAGE_TYPE ||
+              String(importedRow.body || "").includes("CAM_GUI_TEST_RESPONSE")
+            )
+          ) {
+            appendTestEvent(importedRow.correlationId, "reply_received", {
+              inbound: importedRow,
+              relayed: true,
+            });
+          }
+          this.#ingestDiscoveryEvidence({
+            targetPeerName: null,
+            source: "mailbox",
+            body: importedRow.body,
+            sourceAgent: importedRow.sourceAgent,
+            correlationId: importedRow.correlationId,
+            messageType: importedRow.messageType,
+          });
+          imported.push(importedRow);
+          seenRelayKeys.add(relayKey);
+          for (const listener of [...this.mailboxListeners]) {
+            try {
+              listener(importedRow);
+            } catch (error) {
+              this.log("mailbox.listener.error", { error: error.message });
+            }
+          }
+        }
+      } catch (error) {
+        this.log("peer.remote_inbox.harvest_failed", {
+          peerName: peer.name,
+          targetAgent,
+          error: error.message,
+        });
+      }
+    }
+
+    return imported;
   }
 
   async #fetchRemoteCamInventory(peer, remoteRoot) {
@@ -1677,6 +2031,7 @@ export class AgentManagerDaemon {
         return {
           ok: true,
           source: "cam inventory export",
+          degraded: false,
           inventory: JSON.parse(exported.text),
         };
       } catch (error) {
@@ -1706,11 +2061,14 @@ export class AgentManagerDaemon {
         return {
           ok: true,
           source: "remote ~/.qexow-cam/agents.json",
+          degraded: true,
           inventory: {
             version: 1,
             nodeName: parsed?.nodeName || peer.name,
             exportedAt: new Date().toISOString(),
+            exportPolicy: "legacy-raw-registry",
             agents: parsed?.agents || {},
+            discoveries: parsed?.localDiscoveries ? { local: parsed.localDiscoveries } : undefined,
             peers: parsed?.peers || {},
           },
         };
@@ -1744,10 +2102,12 @@ export class AgentManagerDaemon {
     return {
       ok: true,
       source: "cam daemon status + cam agent list",
+      degraded: true,
       inventory: {
         version: 1,
         nodeName: daemonStatus.nodeName || peer.name,
         exportedAt: new Date().toISOString(),
+        exportPolicy: "legacy-agent-list",
         agents: this.#parseLegacyAgentList(agentListResult.text),
         peers: {},
       },
@@ -1757,8 +2117,6 @@ export class AgentManagerDaemon {
   async #sshRunRemoteRegistryExport(peer, remoteRoot) {
     const root = remoteRoot || this.#remoteManagerRoot(peer);
     const command = [
-      `cd ${sq(root)}`,
-      "&&",
       "if [ -f ~/.qexow-cam/agents.json ]; then cat ~/.qexow-cam/agents.json; else echo __CAM_REGISTRY_MISSING__; exit 44; fi",
     ].join(" ");
     this.log("peer.remote_registry.command", {
@@ -1774,14 +2132,7 @@ export class AgentManagerDaemon {
 
   async #sshRunCamDaemonStatus(peer, remoteRoot) {
     const root = remoteRoot || this.#remoteManagerRoot(peer);
-    const command = [
-      `cd ${sq(root)}`,
-      "&&",
-      "node",
-      sq("./bin/cam.js"),
-      "daemon",
-      "status",
-    ].join(" ");
+    const command = this.#remoteCamShell(root, ["daemon", "status"]);
     this.log("peer.remote_status.command", {
       peerName: peer.name,
       command,
@@ -1791,14 +2142,7 @@ export class AgentManagerDaemon {
 
   async #sshRunCamAgentList(peer, remoteRoot) {
     const root = remoteRoot || this.#remoteManagerRoot(peer);
-    const command = [
-      `cd ${sq(root)}`,
-      "&&",
-      "node",
-      sq("./bin/cam.js"),
-      "agent",
-      "list",
-    ].join(" ");
+    const command = this.#remoteCamShell(root, ["agent", "list"]);
     this.log("peer.remote_agent_list.command", {
       peerName: peer.name,
       command,
@@ -2292,6 +2636,17 @@ export class AgentManagerDaemon {
     if (!peer || peer.key) return;
     const doc = peer.docDiscovery;
     if (!doc?.candidateIps?.length) return;
+    if (this.#isSelfPeer(peer)) {
+      this.log("peer.discovery.probe.skipped", {
+        peerName: peer.name,
+        reason: "self-peer",
+      });
+      appendEvent("peer.discovery.probe.skipped", {
+        peerName: peer.name,
+        reason: "self-peer",
+      });
+      return;
+    }
     const usernames = this.#candidateUsernames(peer);
     if (!usernames.length) return;
     let lastFailure = null;
@@ -2527,7 +2882,11 @@ export class AgentManagerDaemon {
       missingUsername: peers.filter((peer) => peer.state === "missing-username").length,
       verified: peers.filter((peer) => peer.state === "verified").length,
       mirrored: peers.filter((peer) => peer.state === "mirrored").length,
+      mirroredDegraded: peers.filter((peer) => peer.state === "mirrored-degraded").length,
       syncFailed: peers.filter((peer) => peer.state === "sync-failed").length,
+      remoteRawDiscoveries: peers.reduce((sum, peer) => sum + Number(peer.remoteRawDiscoveries || 0), 0),
+      remoteApprovedDiscoveries: peers.reduce((sum, peer) => sum + Number(peer.remoteApprovedDiscoveries || 0), 0),
+      remoteRejectedDiscoveries: peers.reduce((sum, peer) => sum + Number(peer.remoteRejectedDiscoveries || 0) + Number(peer.remoteQuarantinedDiscoveries || 0), 0),
       availableKeys: this.#registryKeyPool(registry).length,
       docKeyPaths: (this.docKeyPaths || []).length,
     };
@@ -2537,6 +2896,7 @@ export class AgentManagerDaemon {
   #describePeer(registry, peer) {
     const doc = peer?.docDiscovery || {};
     const remoteSync = peer?.remoteSync || {};
+    const remoteDiscoveryCounts = remoteSync?.remoteDiscoveryCounts || {};
     const ssh = String(peer?.ssh || "");
     const candidateIps = this.#mergeArrays(
       doc.candidateIps || [],
@@ -2553,7 +2913,7 @@ export class AgentManagerDaemon {
     let state = "codex-alias-only";
 
     if (remoteSync?.syncedAt && mirroredAgents > 0) {
-      state = "mirrored";
+      state = remoteSync?.remoteInventoryDegraded ? "mirrored-degraded" : "mirrored";
     } else if (remoteSync?.lastStatus === "failed") {
       state = "sync-failed";
       blockers.push(remoteSync?.lastError || "Remote CAM sync failed.");
@@ -2605,6 +2965,13 @@ export class AgentManagerDaemon {
       candidateHostnames: doc.candidateHostnames || [],
       candidateUsernames,
       mirroredAgents,
+      remoteRawDiscoveries: Number(remoteDiscoveryCounts.total || 0),
+      remoteApprovedDiscoveries: Number(remoteDiscoveryCounts.approved || remoteSync?.remoteApprovedDiscoveries || 0),
+      remoteCandidateDiscoveries: Number(remoteDiscoveryCounts.candidate || 0),
+      remoteQuarantinedDiscoveries: Number(remoteDiscoveryCounts.quarantined || 0),
+      remoteRejectedDiscoveries: Number(remoteDiscoveryCounts.rejected || remoteSync?.remoteRejectedDiscoveries || 0),
+      remoteInventorySchema: remoteSync?.remoteInventorySchema || "",
+      remoteInventoryDegraded: remoteSync?.remoteInventoryDegraded === true,
       remoteSyncStatus: remoteSync?.lastStatus || "",
       remoteSyncError: remoteSync?.lastError || "",
       lastProbeFailure: lastProbeFailure || "",

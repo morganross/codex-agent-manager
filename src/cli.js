@@ -10,8 +10,8 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { apiRequest } from "./api.js";
 import { allPaths, defaultCodexPath, initConfig, loadConfig } from "./config.js";
-import { readMailbox, listAgents, loadRegistry, saveRegistry } from "./registry.js";
-import { paths, readJson, writeJsonAtomic } from "./paths.js";
+import { readMailbox, listAgents, loadRegistry, saveRegistry, trustedInventoryExport } from "./registry.js";
+import { paths, projectRoot, readJson, writeJsonAtomic } from "./paths.js";
 import { logEvent } from "./logger.js";
 
 function usage() {
@@ -232,12 +232,22 @@ async function commandDoctor() {
   // ── SKILLS ──────────────────────────────────────────────────────────────────
   header("QEXOW CAM SKILLS");
   const agySkillDir = path.join(os.homedir(), ".gemini", "antigravity", "skills", "qexow-cam-messaging");
+  const codexUserSkillDir = path.join(os.homedir(), ".agents", "skills", "qexow-cam-messaging");
   const codexSkillDir = path.join(os.homedir(), ".codex", "skills", "qexow-cam-messaging");
   const bossMdDest = path.join(p.root, "boss.md");
-  
+  const docsDir = path.join(p.root, "docs");
+  const docsReadme = path.join(docsDir, "README.md");
+  const docsHowto = path.join(docsDir, "howto-use-qexow-cam.md");
+  const docsOverview = path.join(docsDir, "qexow-cam-plain-english.md");
+
   row(fs.existsSync(agySkillDir), "Antigravity Messaging Skill", agySkillDir);
+  row(fs.existsSync(codexUserSkillDir), "Codex User Messaging Skill", codexUserSkillDir);
   row(fs.existsSync(codexSkillDir), "Codex Messaging Skill", codexSkillDir);
   row(fs.existsSync(bossMdDest), "Boss Agent Prompt", bossMdDest);
+  row(fs.existsSync(docsDir), "Local CAM docs bundle", docsDir);
+  row(fs.existsSync(docsReadme), "Local CAM README", docsReadme);
+  row(fs.existsSync(docsHowto), "Local CAM how-to", docsHowto);
+  row(fs.existsSync(docsOverview), "Local CAM plain-English doc", docsOverview);
 
   // ── INSTALLATION ASSISTANCE ────────────────────────────────────────────────
   const missing = [];
@@ -501,14 +511,7 @@ async function commandInventory(args) {
     throw new Error("expected inventory export");
   }
   const config = loadConfig();
-  const registry = loadRegistry(config);
-  console.log(JSON.stringify({
-    version: registry.version || 1,
-    nodeName: registry.nodeName || config.nodeName || os.hostname(),
-    exportedAt: new Date().toISOString(),
-    agents: Object.values(registry.agents || {}),
-    peers: registry.peers || {},
-  }, null, 2));
+  console.log(JSON.stringify(trustedInventoryExport(config), null, 2));
 }
 
 async function commandNode(args) {
@@ -567,8 +570,81 @@ async function commandNode(args) {
 }
 
 async function commandService(cmd, args) {
+  const opts = parseOptions(args);
+  const serviceFile = path.join(paths().root, "service.json");
+  const name = opts.name || "QexowCam";
+  const headless = !!opts.headless || process.platform !== "win32";
+
+  if (process.platform !== "win32") {
+    const unitName = "qexow-cam.service";
+    const systemdDir = path.join(os.homedir(), ".config", "systemd", "user");
+    const unitPath = path.join(systemdDir, unitName);
+    const appRoot = projectRoot();
+    const launchTarget = fs.existsSync("/usr/local/bin/cam")
+      ? "/usr/local/bin/cam"
+      : null;
+    const currentScript = process.argv[1] && fs.existsSync(process.argv[1]) ? process.argv[1] : null;
+    const execStart = launchTarget
+      ? `${launchTarget} daemon start --headless`
+      : currentScript
+        ? `${process.execPath} ${JSON.stringify(currentScript)} daemon start --headless`
+        : `${process.execPath} daemon start --headless`;
+
+    if (cmd === "uninstall-service") {
+      try {
+        await tryCommand("systemctl", ["--user", "disable", "--now", unitName], 12000);
+        await tryCommand("systemctl", ["--user", "daemon-reload"], 12000);
+      } catch {}
+      try {
+        fs.rmSync(unitPath, { force: true });
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+      try {
+        fs.rmSync(serviceFile, { force: true });
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+      console.log(`removed Linux user service ${unitName} and metadata at ${serviceFile}`);
+      return;
+    }
+
+    fs.mkdirSync(systemdDir, { recursive: true });
+    const unit = [
+      "[Unit]",
+      "Description=Qexow CAM user daemon",
+      "After=network-online.target",
+      "",
+      "[Service]",
+      "Type=simple",
+      `Environment=CAM_APP_ROOT=${appRoot}`,
+      `WorkingDirectory=${appRoot}`,
+      `ExecStart=${execStart}`,
+      "Restart=always",
+      "RestartSec=5",
+      "",
+      "[Install]",
+      "WantedBy=default.target",
+      "",
+    ].join("\n");
+    fs.writeFileSync(unitPath, unit, "utf8");
+    writeJsonAtomic(serviceFile, {
+      name,
+      headless,
+      enabled: true,
+      linuxUserService: true,
+      unitName,
+      unitPath,
+      updatedAt: new Date().toISOString(),
+    });
+    await tryCommand("systemctl", ["--user", "daemon-reload"], 12000);
+    await tryCommand("systemctl", ["--user", "enable", unitName], 12000);
+    await tryCommand("systemctl", ["--user", "restart", unitName], 12000);
+    console.log(`installed Linux user service ${unitName} at ${unitPath}`);
+    return;
+  }
+
   if (cmd === "uninstall-service") {
-    const serviceFile = path.join(paths().root, "service.json");
     try {
       fs.rmSync(serviceFile, { force: true });
     } catch (error) {
@@ -578,10 +654,6 @@ async function commandService(cmd, args) {
     return;
   }
   logEvent("cli.service.action", { command: cmd, args });
-  const opts = parseOptions(args);
-  const name = opts.name || "QexowCam";
-  const headless = !!opts.headless;
-  const serviceFile = path.join(paths().root, "service.json");
   initConfig();
   writeJsonAtomic(serviceFile, {
     name,

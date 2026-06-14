@@ -4,6 +4,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export function projectRoot() {
+  if (process.env.CAM_APP_ROOT) {
+    return path.resolve(process.env.CAM_APP_ROOT);
+  }
   return path.resolve(path.dirname(process.execPath), "..");
 }
 

@@ -1,6 +1,6 @@
 [Setup]
 AppName=Qexow CAM
-AppVersion=2.1.40
+AppVersion=2.1.41
 DefaultDirName={autopf}\Qexow CAM
 DefaultGroupName=Qexow CAM
 OutputDir=dist
@@ -30,6 +30,10 @@ Name: "tray"; Description: "System Tray GUI & Shortcuts"; Types: full custom
 ; The ONE executable — cam.exe is a Node.js SEA containing all logic
 Source: "dist\cam.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: daemon
 Source: "dist\qexow-cam-gui.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: tray
+Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "boss.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "docs\howto-use-qexow-cam.md"; DestDir: "{app}\docs"; Flags: ignoreversion
+Source: "docs\qexow-cam-plain-english.md"; DestDir: "{app}\docs"; Flags: ignoreversion
 
 [Icons]
 ; Start Menu: opens the single user-facing Windows GUI.

@@ -14,6 +14,7 @@ const installer = read("installer.iss");
 const workflow = read(".github/workflows/release.yml");
 const threadDiscovery = read("src/thread-discovery.js");
 const registry = read("src/registry.js");
+const discoveryPolicy = read("src/discovery-policy.js");
 const staleInstallAudit = read("scripts/assert-no-stale-installed-cam.ps1");
 const uninstallBranchIndex = cli.indexOf('if (cmd === "uninstall-service")');
 const serviceLogEventIndex = cli.indexOf('logEvent("cli.service.action"');
@@ -22,9 +23,9 @@ const installerShipsQueryThreads =
   installer.includes('Source: "query_threads.py"');
 
 const checks = [
-  ["package version is 2.1.40", pkg.version === "2.1.40"],
+  ["package version is 2.1.41", pkg.version === "2.1.41"],
   ["config uses explicit default CAM port 37631", config.includes("export const DEFAULT_CAM_PORT = 37631") && config.includes("const port = configuredPort || DEFAULT_CAM_PORT")],
-  ["daemon exposes CAM_VERSION 2.1.40", daemon.includes('const CAM_VERSION = "2.1.40";')],
+  ["daemon exposes CAM_VERSION 2.1.41", daemon.includes('const CAM_VERSION = "2.1.41";')],
   ["daemon health includes version", daemon.includes("version: CAM_VERSION")],
   ["daemon supports strict thread-not-found detection", daemon.includes("STRICT_THREAD_NOT_FOUND")],
   ["daemon strict send does not queue unresolved targets", daemon.includes("strict send cannot deliver") && daemon.includes("message.failed.strict")],
@@ -39,6 +40,14 @@ const checks = [
   ["native discovery emits route metadata", threadDiscovery.includes("inferRouteMetadata") && threadDiscovery.includes("remote-projects")],
   ["native discovery merges session index, state, and rollout sources", threadDiscovery.includes("loadSessionIndex") && threadDiscovery.includes("indexRollouts") && threadDiscovery.includes("discoverStateRows")],
   ["native discovery treats active sessions ahead of archived copies", threadDiscovery.includes('["sessions", 2]') && threadDiscovery.includes('["archived_sessions", 1]') && threadDiscovery.includes("info.rank !== 2")],
+  ["discovery policy quarantines machine subagents", discoveryPolicy.includes("machine-spawned-subagent") && discoveryPolicy.includes("source?.subagent?.thread_spawn")],
+  ["discovery policy keeps temporary work out of active roster", discoveryPolicy.includes("TEMPORARY_NAME_RE") && discoveryPolicy.includes("temporary-work-title")],
+  ["inventory export is schema 2 with raw discovery report", registry.includes("inventorySchema: 2") && registry.includes("approved-agents-only-plus-raw-discovery-report") && registry.includes("localDiscoveries")],
+  ["daemon stores local discovery classifications", daemon.includes("saveLocalDiscoveries") && daemon.includes("sync.discovery.classified") && daemon.includes("discoveryDisposition")],
+  ["daemon stores remote raw discovery snapshots", daemon.includes("saveRemoteDiscoverySnapshot") && daemon.includes("remoteRawDiscoveries") && daemon.includes("remoteInventoryDegraded")],
+  ["peer sync mirrors approved agents only", daemon.includes("canonicalizeTrustedInventoryAgents(Object.values(remoteRegistry?.agents || {}))") && daemon.includes("approvedAgents: remoteAgents")],
+  ["remote command prefers installed cam before legacy repo", daemon.includes("if command -v cam >/dev/null 2>&1; then cam") && daemon.includes("elif [ -x /usr/local/bin/cam ]")],
+  ["GUI displays raw approved quarantined rejected peer counts", gui.includes('"raw"') && gui.includes('"approved"') && gui.includes('"quarantined"') && gui.includes('"rejected"')],
   ["daemon discovery does not launch Python", !daemon.includes('execFile(cmd, [scriptPath]') && !daemon.includes('tryPython("python")') && daemon.includes("discoverThreads()")],
   ["GUI active classifier does not launch Python", !gui.includes('psi.FileName = "python"') && !gui.includes("FindQueryThreadsScript") && gui.includes("source=daemon-registry")],
   ["installer does not ship query_threads.py", !installerShipsQueryThreads],

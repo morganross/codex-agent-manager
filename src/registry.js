@@ -2,6 +2,90 @@ import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import { appendJsonl, paths, readJson, readJsonl, writeJsonAtomic } from "./paths.js";
+import { classifyRegistryAgent, discoveryCounts } from "./discovery-policy.js";
+
+function mirrorLikeName(name) {
+  return String(name || "").includes("::");
+}
+
+function numericAliasSuffix(name) {
+  return /-\d+$/.test(String(name || ""));
+}
+
+export function isRemoteMirrorAgent(agent) {
+  if (!agent || typeof agent !== "object") return false;
+  if (agent.threadSource === "remote-cam") return true;
+  if (String(agent.route || "").startsWith("peer:")) return true;
+  if (agent.discoveredBy === "remote-cam-sync") return true;
+  if (agent.remotePeerName || agent.remoteAgentName) return true;
+  return false;
+}
+
+export function isTrustedInventoryAgent(agent) {
+  if (!agent || typeof agent !== "object") return false;
+  if (!agent.name) return false;
+  if (!classifyRegistryAgent(agent).approved) return false;
+  if (isRemoteMirrorAgent(agent)) return false;
+  if (mirrorLikeName(agent.name)) return false;
+  const threadSource = String(agent.threadSource || "codex");
+  if (!["codex", "antigravity", "mailbox"].includes(threadSource)) return false;
+  return true;
+}
+
+function inventoryPreferenceScore(agent) {
+  let score = 0;
+  const name = String(agent?.name || "");
+  const threadSource = String(agent?.threadSource || "codex");
+  if (threadSource === "mailbox") score += 1000;
+  if (!mirrorLikeName(name)) score += 100;
+  if (!numericAliasSuffix(name)) score += 30;
+  if (threadSource === "codex") score += 20;
+  if (threadSource === "antigravity") score += 10;
+  score -= name.length / 1000;
+  return score;
+}
+
+export function canonicalizeTrustedInventoryAgents(agents) {
+  const chosen = new Map();
+  const rows = (agents || []).filter(isTrustedInventoryAgent);
+  for (const agent of rows) {
+    const key = agent.threadId ? `thread:${agent.threadId}` : `name:${agent.name}`;
+    const existing = chosen.get(key);
+    if (!existing || inventoryPreferenceScore(agent) > inventoryPreferenceScore(existing)) {
+      chosen.set(key, agent);
+    }
+  }
+  return [...chosen.values()].sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+}
+
+export function trustedInventoryExport(config) {
+  const registry = loadRegistry(config);
+  const localDiscoveryRows = registry.localDiscoveries?.rows || [];
+  const approvedAgents = canonicalizeTrustedInventoryAgents(Object.values(registry.agents || {}));
+  const counts = discoveryCounts(localDiscoveryRows);
+  return {
+    inventorySchema: 2,
+    version: registry.version || 1,
+    nodeName: registry.nodeName || config?.nodeName || os.hostname(),
+    exportedAt: new Date().toISOString(),
+    exportPolicy: "approved-agents-only-plus-raw-discovery-report",
+    agents: approvedAgents,
+    discoveries: {
+      local: registry.localDiscoveries || {
+        schema: 1,
+        updatedAt: null,
+        source: "not-recorded",
+        rows: [],
+        counts,
+      },
+    },
+    counts: {
+      localDiscoveries: counts,
+      approvedAgents: approvedAgents.length,
+    },
+    peers: registry.peers || {},
+  };
+}
 
 export function loadRegistry(config) {
   const p = paths();
@@ -14,6 +98,8 @@ export function loadRegistry(config) {
   });
   registry.agents ||= {};
   registry.peers ||= {};
+  registry.localDiscoveries ||= { schema: 1, updatedAt: null, source: "not-recorded", rows: [], counts: discoveryCounts([]) };
+  registry.remoteDiscoveries ||= {};
 
   try {
     const codexHome = config?.codexHome || process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
@@ -62,6 +148,32 @@ export function loadRegistry(config) {
 export function saveRegistry(registry) {
   registry.updatedAt = new Date().toISOString();
   writeJsonAtomic(paths().registry, registry);
+}
+
+export function saveLocalDiscoveries(config, rows, source = "native-thread-discovery") {
+  const registry = loadRegistry(config);
+  registry.localDiscoveries = {
+    schema: 1,
+    updatedAt: new Date().toISOString(),
+    source,
+    rows: rows || [],
+    counts: discoveryCounts(rows || []),
+  };
+  saveRegistry(registry);
+  return registry.localDiscoveries;
+}
+
+export function saveRemoteDiscoverySnapshot(config, peerName, snapshot) {
+  const registry = loadRegistry(config);
+  registry.remoteDiscoveries ||= {};
+  registry.remoteDiscoveries[peerName] = {
+    schema: 1,
+    peerName,
+    syncedAt: new Date().toISOString(),
+    ...snapshot,
+  };
+  saveRegistry(registry);
+  return registry.remoteDiscoveries[peerName];
 }
 
 export function getPeer(config, name) {

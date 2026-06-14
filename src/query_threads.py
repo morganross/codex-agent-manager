@@ -266,7 +266,8 @@ def infer_route_metadata(cwd, thread_source, state):
             metadata["transport"] = "codex-managed"
             metadata["route"] = f"codex-managed:{alias}"
             return metadata
-    if normalized.startswith('/home/') or normalized.startswith('/root/') or normalized.startswith('/opt/'):
+    allow_selected_remote_fallback = (os.name == 'nt')
+    if allow_selected_remote_fallback and (normalized.startswith('/home/') or normalized.startswith('/root/') or normalized.startswith('/opt/')):
         selected = state_value(state, 'selected-remote-host-id', '') or ''
         alias = aliases.get(selected) or selected.replace('remote-ssh-discovered:', '') or "remote"
         metadata["nodeName"] = alias

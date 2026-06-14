@@ -12,9 +12,9 @@ using System.Windows.Forms;
 using System.Reflection;
 using System.Net.Sockets;
 
-[assembly: AssemblyVersion("2.1.40.0")]
-[assembly: AssemblyFileVersion("2.1.40.0")]
-[assembly: AssemblyInformationalVersion("2.1.40")]
+[assembly: AssemblyVersion("2.1.41.0")]
+[assembly: AssemblyFileVersion("2.1.41.0")]
+[assembly: AssemblyInformationalVersion("2.1.41")]
 
 namespace QexowCamGui
 {
@@ -404,7 +404,7 @@ namespace QexowCamGui
         {
             peersGrid.Columns.Clear();
             peersGrid.Rows.Clear();
-            foreach (string column in new[] { "name", "state", "transport", "ssh", "candidateIps", "candidateUsers", "key", "mirrored", "remoteNode", "syncedAt", "blocker" })
+            foreach (string column in new[] { "name", "state", "transport", "ssh", "candidateIps", "candidateUsers", "key", "mirrored", "raw", "approved", "quarantined", "rejected", "schema", "remoteNode", "syncedAt", "blocker" })
             {
                 peersGrid.Columns.Add(column, column);
             }
@@ -414,6 +414,11 @@ namespace QexowCamGui
             peersGrid.Columns["candidateUsers"].HeaderText = "users";
             peersGrid.Columns["key"].HeaderText = "key";
             peersGrid.Columns["mirrored"].HeaderText = "mirrored";
+            peersGrid.Columns["raw"].HeaderText = "raw";
+            peersGrid.Columns["approved"].HeaderText = "approved";
+            peersGrid.Columns["quarantined"].HeaderText = "quarantined";
+            peersGrid.Columns["rejected"].HeaderText = "rejected";
+            peersGrid.Columns["schema"].HeaderText = "schema";
             peersGrid.Columns["remoteNode"].HeaderText = "remote node";
             peersGrid.Columns["syncedAt"].HeaderText = "last sync";
             peersGrid.Columns["blocker"].HeaderText = "blocker";
@@ -425,6 +430,11 @@ namespace QexowCamGui
             peersGrid.Columns["candidateUsers"].FillWeight = 8;
             peersGrid.Columns["key"].FillWeight = 7;
             peersGrid.Columns["mirrored"].FillWeight = 6;
+            peersGrid.Columns["raw"].FillWeight = 6;
+            peersGrid.Columns["approved"].FillWeight = 6;
+            peersGrid.Columns["quarantined"].FillWeight = 6;
+            peersGrid.Columns["rejected"].FillWeight = 6;
+            peersGrid.Columns["schema"].FillWeight = 6;
             peersGrid.Columns["remoteNode"].FillWeight = 10;
             peersGrid.Columns["syncedAt"].FillWeight = 10;
             peersGrid.Columns["blocker"].FillWeight = 24;
@@ -440,6 +450,11 @@ namespace QexowCamGui
                     JoinList(peer, "candidateUsernames"),
                     String.IsNullOrWhiteSpace(Value(peer, "key")) ? "no" : "yes",
                     Value(peer, "mirroredAgents"),
+                    Value(peer, "remoteRawDiscoveries"),
+                    Value(peer, "remoteApprovedDiscoveries"),
+                    Value(peer, "remoteQuarantinedDiscoveries"),
+                    Value(peer, "remoteRejectedDiscoveries"),
+                    Value(peer, "remoteInventorySchema") + (ValueBool(peer, "remoteInventoryDegraded") ? " legacy" : ""),
                     Value(peer, "remoteNodeName"),
                     ShortIso(Value(peer, "syncedAt")),
                     Value(peer, "blockerSummary")
@@ -448,6 +463,7 @@ namespace QexowCamGui
                 Color color = Color.Gray;
                 string state = Value(peer, "state").ToLowerInvariant();
                 if (state == "mirrored") color = Color.LimeGreen;
+                else if (state == "mirrored-degraded") color = Color.Goldenrod;
                 else if (state == "verified" || state == "probe-ready") color = Color.DodgerBlue;
                 else if (state == "missing-key" || state == "missing-ip" || state == "missing-username" || state == "sync-failed" || state == "probe-failed") color = Color.OrangeRed;
                 row.DefaultCellStyle.ForeColor = color;
@@ -477,18 +493,25 @@ namespace QexowCamGui
             int probeReady = 0;
             int probeFailed = 0;
             int syncFailed = 0;
+            int rawDiscoveries = 0;
+            int approvedDiscoveries = 0;
+            int rejectedDiscoveries = 0;
             foreach (Dictionary<string, object> peer in peers)
             {
                 string state = Value(peer, "state");
                 if (String.Equals(state, "mirrored", StringComparison.OrdinalIgnoreCase)) mirrored++;
+                if (String.Equals(state, "mirrored-degraded", StringComparison.OrdinalIgnoreCase)) mirrored++;
                 if (String.Equals(state, "missing-key", StringComparison.OrdinalIgnoreCase)) missingKey++;
                 if (String.Equals(state, "missing-ip", StringComparison.OrdinalIgnoreCase)) missingIp++;
                 if (String.Equals(state, "missing-username", StringComparison.OrdinalIgnoreCase)) missingUsername++;
                 if (String.Equals(state, "probe-ready", StringComparison.OrdinalIgnoreCase)) probeReady++;
                 if (String.Equals(state, "probe-failed", StringComparison.OrdinalIgnoreCase)) probeFailed++;
                 if (String.Equals(state, "sync-failed", StringComparison.OrdinalIgnoreCase)) syncFailed++;
+                rawDiscoveries += ToInt(Value(peer, "remoteRawDiscoveries"));
+                approvedDiscoveries += ToInt(Value(peer, "remoteApprovedDiscoveries"));
+                rejectedDiscoveries += ToInt(Value(peer, "remoteQuarantinedDiscoveries")) + ToInt(Value(peer, "remoteRejectedDiscoveries"));
             }
-            discoveryLabel.Text = "Remote discovery: " + peers.Count + " peers, " + mirrored + " mirrored, " + probeReady + " ready, " + probeFailed + " probe failed, " + syncFailed + " sync failed, " + missingKey + " missing key, " + missingIp + " missing IP, " + missingUsername + " missing user.";
+            discoveryLabel.Text = "Remote discovery: " + peers.Count + " peers, " + mirrored + " mirrored, " + rawDiscoveries + " raw, " + approvedDiscoveries + " approved, " + rejectedDiscoveries + " not promoted, " + probeReady + " ready, " + probeFailed + " probe failed, " + syncFailed + " sync failed.";
             outputBox.Text = AppendLine(outputBox.Text, "Remote discovery loaded " + peers.Count + " peer rows.");
         }
 
@@ -1016,6 +1039,22 @@ namespace QexowCamGui
             return Convert.ToString(map[key]);
         }
 
+        private static bool ValueBool(Dictionary<string, object> map, string key)
+        {
+            if (map == null || !map.ContainsKey(key) || map[key] == null) return false;
+            object value = map[key];
+            if (value is bool) return (bool)value;
+            string text = Convert.ToString(value);
+            return String.Equals(text, "true", StringComparison.OrdinalIgnoreCase) || text == "1";
+        }
+
+        private static int ToInt(string value)
+        {
+            int parsed;
+            if (Int32.TryParse(value, out parsed)) return parsed;
+            return 0;
+        }
+
         private static string DisplayTitle(Dictionary<string, object> agent)
         {
             string title = Value(agent, "chatTitle");
@@ -1329,7 +1368,7 @@ namespace QexowCamGui
 
         public static string Version
         {
-            get { return "2.1.40"; }
+            get { return "2.1.41"; }
         }
     }
 }

@@ -12,6 +12,9 @@ export function defaultCodexPath() {
     const candidate = path.join(os.homedir(), "AppData", "Local", "OpenAI", "Codex", "bin", "codex.exe");
     if (fs.existsSync(candidate)) return candidate;
   }
+  if (process.platform !== "win32") {
+    return "codex";
+  }
   throw new Error("Codex execution path not configured. Please set the CAM_CODEX_EXE environment variable or the codexPath in config.json.");
 }
 

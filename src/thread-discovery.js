@@ -197,7 +197,8 @@ function inferRouteMetadata(cwd, threadSource, state) {
       };
     }
   }
-  if (normalized.startsWith("/home/") || normalized.startsWith("/root/") || normalized.startsWith("/opt/")) {
+  const allowSelectedRemoteFallback = process.platform === "win32";
+  if (allowSelectedRemoteFallback && (normalized.startsWith("/home/") || normalized.startsWith("/root/") || normalized.startsWith("/opt/"))) {
     const selected = stateValue(state, "selected-remote-host-id", "") || "";
     const alias = aliases.get(selected) || selected.replace("remote-ssh-discovered:", "") || "remote";
     return {
