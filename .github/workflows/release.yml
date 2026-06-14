@@ -67,6 +67,33 @@ jobs:
         $staleCodex = Join-Path $env:LOCALAPPDATA "Programs\Codex Agent Manager"
         $camHome = Join-Path $env:USERPROFILE ".qexow-cam"
         $legacyCamHome = Join-Path $env:USERPROFILE ".codex-agent-manager"
+        $expectedVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+
+        function Wait-CamHealth {
+          param([string]$ExpectedVersion)
+          for ($i = 0; $i -lt 40; $i++) {
+            try {
+              $health = Invoke-RestMethod -Uri "http://127.0.0.1:37631/health" -TimeoutSec 2
+              if ($health.ok -and $health.version -eq $ExpectedVersion) {
+                return $health
+              }
+            } catch {
+            }
+            Start-Sleep -Seconds 1
+          }
+          throw "Headless installer did not start a healthy CAM daemon on 127.0.0.1:37631"
+        }
+
+        function Assert-CamProcessState {
+          param([bool]$ExpectGui)
+          $processes = Get-CimInstance Win32_Process
+          $camProcesses = @($processes | Where-Object { $_.Name -eq "cam.exe" -and $_.ExecutablePath -like "C:\Program Files\Qexow CAM\*" })
+          $guiProcesses = @($processes | Where-Object { $_.Name -eq "qexow-cam-gui.exe" -and $_.ExecutablePath -like "C:\Program Files\Qexow CAM\*" })
+          if ($camProcesses.Count -lt 1) { throw "No installed cam.exe daemon process is running after install" }
+          if ($ExpectGui -and $guiProcesses.Count -ne 1) { throw "Expected exactly one installed qexow-cam-gui.exe process, found $($guiProcesses.Count)" }
+          if (-not $ExpectGui -and $guiProcesses.Count -ne 0) { throw "Headless install unexpectedly launched qexow-cam-gui.exe" }
+        }
+
         New-Item -ItemType Directory -Force -Path $staleQexow,$staleCodex | Out-Null
         Set-Content -Path (Join-Path $staleQexow "cam.exe") -Value "stale fake cam"
         Set-Content -Path (Join-Path $staleQexow "tray_windows_release.exe") -Value "stale fake tray"
@@ -93,8 +120,9 @@ jobs:
         if (Test-Path (Join-Path $camHome "agents.json")) { throw "Reinstall did not remove stale agents.json map" }
         if (Test-Path (Join-Path $camHome "mailbox.jsonl")) { throw "Reinstall did not remove stale mailbox.jsonl" }
         if (Test-Path (Join-Path $legacyCamHome "agents.json")) { throw "Reinstall did not remove legacy agents.json map" }
-        if (Test-Path $camHome) { throw "Default reinstall did not fully remove CAM home $camHome" }
         if (Test-Path $legacyCamHome) { throw "Default reinstall did not fully remove legacy CAM home $legacyCamHome" }
+        $health = Wait-CamHealth -ExpectedVersion $expectedVersion
+        Assert-CamProcessState -ExpectGui $false
         powershell -NoProfile -ExecutionPolicy Bypass -File scripts\assert-no-stale-installed-cam.ps1
         New-Item -ItemType Directory -Force -Path $camHome | Out-Null
         Set-Content -Path (Join-Path $camHome "agents.json") -Value '{"preserve_on_reinstall":true}'
@@ -104,6 +132,8 @@ jobs:
           Get-Content $log -ErrorAction SilentlyContinue
           throw "Installer preserve-state smoke failed with exit code $($p2.ExitCode)"
         }
+        $health = Wait-CamHealth -ExpectedVersion $expectedVersion
+        Assert-CamProcessState -ExpectGui $false
         if (-not (Test-Path (Join-Path $camHome "agents.json"))) { throw "Preserve-state reinstall unexpectedly removed agents.json" }
         if (-not (Test-Path (Join-Path $camHome "mailbox.jsonl"))) { throw "Preserve-state reinstall unexpectedly removed mailbox.jsonl" }
         $uninstaller = "C:\Program Files\Qexow CAM\unins000.exe"

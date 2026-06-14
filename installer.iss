@@ -1,6 +1,6 @@
 [Setup]
 AppName=Qexow CAM
-AppVersion=2.1.42
+AppVersion=2.1.43
 DefaultDirName={autopf}\Qexow CAM
 DefaultGroupName=Qexow CAM
 OutputDir=dist
@@ -110,12 +110,6 @@ Type: files; Name: "{userstartup}\Codex Agent Manager.cmd"
 Type: filesandordirs; Name: "{localappdata}\Programs\Qexow CAM"
 Type: filesandordirs; Name: "{localappdata}\Programs\Codex Agent Manager"
 Type: filesandordirs; Name: "{localappdata}\Qexow CAM"
-
-[Run]
-; Record local startup metadata. This does not create scheduled tasks or shell scripts.
-Filename: "{app}\cam.exe"; Parameters: "install-service"; StatusMsg: "Configuring startup service..."; Components: daemon; Flags: runhidden; Check: not IsHeadlessInstall
-; After install: start tray (which auto-starts the daemon) — no cmd windows
-Filename: "{app}\qexow-cam-gui.exe"; Description: "Launch Qexow CAM GUI"; Flags: nowait; Components: tray; Check: not IsHeadlessInstall
 
 [Code]
 procedure KillProcess(ImageName: string);
@@ -450,12 +444,14 @@ procedure LaunchInstalledCamIfNeeded();
 var
   ResultCode: Integer;
 begin
-  if IsHeadlessInstall() then begin
-    exit;
-  end;
-
+  // Headless means no visible GUI, not a dead install. Always record startup
+  // metadata and start the correct runtime path after files land.
   Exec(ExpandConstant('{app}\cam.exe'), 'install-service', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec(ExpandConstant('{app}\qexow-cam-gui.exe'), '', '', SW_SHOWNORMAL, ewNoWait, ResultCode);
+  if IsHeadlessInstall() then begin
+    Exec(ExpandConstant('{app}\cam.exe'), 'daemon start --headless', '', SW_HIDE, ewNoWait, ResultCode);
+  end else begin
+    Exec(ExpandConstant('{app}\qexow-cam-gui.exe'), '', '', SW_SHOWNORMAL, ewNoWait, ResultCode);
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -474,9 +470,7 @@ begin
     exit;
   end;
   if CurStep = ssPostInstall then begin
-    if WizardSilent then begin
-      LaunchInstalledCamIfNeeded();
-    end;
+    LaunchInstalledCamIfNeeded();
   end;
 end;
 

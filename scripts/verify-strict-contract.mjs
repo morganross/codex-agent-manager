@@ -23,9 +23,9 @@ const installerShipsQueryThreads =
   installer.includes('Source: "query_threads.py"');
 
 const checks = [
-  ["package version is 2.1.42", pkg.version === "2.1.42"],
+  ["package version is 2.1.43", pkg.version === "2.1.43"],
   ["config uses explicit default CAM port 37631", config.includes("export const DEFAULT_CAM_PORT = 37631") && config.includes("const port = configuredPort || DEFAULT_CAM_PORT")],
-  ["daemon exposes CAM_VERSION 2.1.42", daemon.includes('const CAM_VERSION = "2.1.42";')],
+  ["daemon exposes CAM_VERSION 2.1.43", daemon.includes('const CAM_VERSION = "2.1.43";')],
   ["daemon health includes version", daemon.includes("version: CAM_VERSION")],
   ["daemon supports strict thread-not-found detection", daemon.includes("STRICT_THREAD_NOT_FOUND")],
   ["daemon strict send does not queue unresolved targets", daemon.includes("strict send cannot deliver") && daemon.includes("message.failed.strict")],
@@ -73,7 +73,8 @@ const checks = [
   ["installer uses valid USERPROFILE env constant", installer.includes("ExpandConstant('{%USERPROFILE}\\.qexow-cam')") && !installer.includes("{userprofile}")],
   ["uninstaller removes all CAM local state", installer.includes("procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);") && installer.includes("FullWipeCamHomes();")],
   ["uninstaller force-kills known CAM processes", installer.includes("procedure KillKnownCamProcesses();") && installer.includes("KillKnownCamProcesses();")],
-  ["silent installer explicitly launches installed CAM", installer.includes("procedure LaunchInstalledCamIfNeeded();") && installer.includes("if WizardSilent then begin") && installer.includes("LaunchInstalledCamIfNeeded();")],
+  ["installer has one custom postinstall startup path", installer.includes("procedure LaunchInstalledCamIfNeeded();") && installer.includes("if CurStep = ssPostInstall then begin") && installer.includes("LaunchInstalledCamIfNeeded();") && !installer.includes("[Run]")],
+  ["headless installer starts daemon without GUI", installer.includes("daemon start --headless") && installer.includes("if IsHeadlessInstall() then begin") && installer.includes("qexow-cam-gui.exe")],
   ["installer removes old per-user Qexow CAM install", installer.includes("{localappdata}\\Programs\\Qexow CAM") && installer.includes("RemoveDirIfExists")],
   ["installer has no PowerShell cleanup path", !installer.includes("powershell.exe") && !installer.includes("RunPreinstallCleanupPowerShell")],
   ["runtime and installer have no Python discovery payload", !daemon.includes("query_threads.py") && !gui.includes("query_threads.py") && !installerShipsQueryThreads],
@@ -81,6 +82,7 @@ const checks = [
   ["installer app version matches package", installer.includes(`AppVersion=${pkg.version}`)],
   ["GUI version matches package", gui.includes(`get { return "${pkg.version}"; }`)],
   ["release workflow smoke tests installer", workflow.includes("Smoke test installer") && workflow.includes("Installation process succeeded")],
+  ["release workflow verifies headless daemon startup", workflow.includes("Wait-CamHealth") && workflow.includes("Headless installer did not start a healthy CAM daemon") && workflow.includes("Headless install unexpectedly launched qexow-cam-gui.exe")],
   ["release workflow tests stale per-user cleanup", workflow.includes("Programs\\Qexow CAM") && workflow.includes("assert-no-stale-installed-cam.ps1")],
   ["release workflow tests reinstall map deletion", workflow.includes("Reinstall did not remove stale agents.json map") && workflow.includes("tests.jsonl")],
   ["release workflow tests uninstall full CAM home deletion", workflow.includes("Uninstall did not remove CAM home") && workflow.includes("unins000.exe")],
