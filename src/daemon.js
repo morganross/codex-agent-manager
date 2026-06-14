@@ -52,11 +52,12 @@ import { discoverPeerFactsFromMarkdown, discoverSshKeyPathsFromMarkdown } from "
 
 const CAM_TEST_MAILBOX_AGENT = "CAM test, Kexau CAM test suite mailbox";
 const MAILBOX_ONLY_THREAD_SOURCES = new Set(["mailbox", "gui-only"]);
-const CAM_VERSION = "2.1.50";
+const CAM_VERSION = "2.1.51";
 const STRICT_THREAD_NOT_FOUND = /thread not found/i;
 const GUI_TEST_MESSAGE_TYPE = "cam-gui-test";
 const GUI_TEST_REPLY_MESSAGE_TYPE = "cam-gui-test-reply";
 const REMOTE_SYNC_INTERVAL_MS = 5 * 60 * 1000;
+const REMOTE_INVENTORY_TIMEOUT_MS = 90000;
 const DEFAULT_REMOTE_ROOTS = [
   "/opt/qexow-cam",
   "/home/ubuntu/codex-agent-manager",
@@ -1929,7 +1930,7 @@ export class AgentManagerDaemon {
       peerName: peer.name,
       command,
     });
-    return this.#probeRemoteCommand(peer, command, 20000);
+    return this.#probeRemoteCommand(peer, command, REMOTE_INVENTORY_TIMEOUT_MS);
   }
 
   async #sshRunCamInbox(peer, remoteRoot, targetAgent) {
